@@ -20,15 +20,25 @@ CS, MOSI, SCK = 0x01, 0x02, 0x08
 SPI_HALF = 100  # ns, half of one SCK period
 
 
-async def spi_write(dut, value, bits=8):
+def frame(*bases):
+    # The 16-bit frame for the given bases. One base is used for all four
+    # digits, four bases are given for digits 0..3 (digit 3 goes first).
+    if len(bases) == 1:
+        bases = bases * 4
+    assert len(bases) == 4
+    return sum((b & 0xF) << (4 * d) for d, b in enumerate(bases))
+
+
+async def spi_write(dut, value, bits=16):
     # Bit-bang one SPI frame, mode 0, MSB first, CS idle high. MOSI changes
-    # while SCK is low and is sampled on the rising edge. Fewer bits than 8
-    # make a cut-short frame. The whole write takes 1.6 us, well inside half
-    # a clock cycle (5 us), so it fits between clock edges.
+    # while SCK is low and is sampled on the rising edge. Fewer bits than 16
+    # make a cut-short frame (the first bits of the value are sent). The whole
+    # write takes 3.3 us, well inside half a clock cycle (5 us), so it fits
+    # between clock edges.
     dut.uio_in.value = 0            # CS low, SCK low
     await Timer(SPI_HALF, unit="ns")
     for i in range(bits):
-        bit = (value >> (7 - i)) & 1
+        bit = (value >> (15 - i)) & 1
         dut.uio_in.value = bit * MOSI
         await Timer(SPI_HALF, unit="ns")
         dut.uio_in.value = bit * MOSI | SCK
@@ -40,7 +50,8 @@ async def spi_write(dut, value, bits=8):
 
 
 async def start(dut, en, sel=0, base=None):
-    # Start the clock, hold reset for a few cycles, then release it
+    # Start the clock, hold reset for a few cycles, then release it.
+    # base is one number for all digits, or a list of four (digit 0 first).
     cocotb.start_soon(Clock(dut.clk, 10, unit="us").start())
     dut.ena.value = 1
     dut.ui_in.value = ui(en, sel)
@@ -50,11 +61,12 @@ async def start(dut, en, sel=0, base=None):
     dut.rst_n.value = 1
     # Look at the outputs on the falling edge, away from the rising edge
     await FallingEdge(dut.clk)
-    # Reset clears the base, so it is written after reset. EN is held at 0
+    # Reset clears the bases, so they are written after reset. EN is held at 0
     # during the write and one clock cycle, so the count stays at 0.
     if base is not None:
+        bases = base if isinstance(base, (list, tuple)) else [base]
         dut.ui_in.value = ui(0, sel)
-        await spi_write(dut, base)
+        await spi_write(dut, frame(*bases))
         await FallingEdge(dut.clk)
         dut.ui_in.value = ui(en, sel)
 
@@ -250,16 +262,16 @@ async def test_base_default_16(dut):
 @cocotb.test()
 async def test_spi_short_frame_ignored(dut):
     await start(dut, 1, base=10)
-    await spi_write(dut, 0x03, bits=7)   # cut short
-    await spi_write(dut, 0x00, bits=3)
+    await spi_write(dut, frame(3), bits=15)   # cut short
+    await spi_write(dut, frame(0), bits=3)
     assert await read_base(dut) == 9
 
 
 @cocotb.test()
 async def test_spi_cs_high_ignored(dut):
     await start(dut, 1, base=10)
-    # SCK edges with CS high: eight clocks carrying 0x03, nothing happens
-    for _ in range(8):
+    # SCK edges with CS high: sixteen clocks carrying 1s, nothing happens
+    for _ in range(16):
         dut.uio_in.value = CS | MOSI | SCK
         await Timer(SPI_HALF, unit="ns")
         dut.uio_in.value = CS | MOSI
@@ -270,13 +282,12 @@ async def test_spi_cs_high_ignored(dut):
 @cocotb.test()
 async def test_spi_two_frames_second_wins(dut):
     await start(dut, 1)
-    # Two frames in one CS-low period: 16 SCK edges, the second frame wins.
-    # The upper 4 bits of a frame are ignored (0xA3 is base 3).
+    # Two frames in one CS-low period: 32 SCK edges, the second frame wins
     dut.uio_in.value = 0
     await Timer(SPI_HALF, unit="ns")
-    for value in (0x0A, 0xA3):
-        for i in range(8):
-            bit = (value >> (7 - i)) & 1
+    for value in (frame(0xA), frame(3)):
+        for i in range(16):
+            bit = (value >> (15 - i)) & 1
             dut.uio_in.value = bit * MOSI
             await Timer(SPI_HALF, unit="ns")
             dut.uio_in.value = bit * MOSI | SCK
@@ -285,6 +296,59 @@ async def test_spi_two_frames_second_wins(dut):
     dut.uio_in.value = CS
     await Timer(SPI_HALF, unit="ns")
     assert await read_base(dut) == 2
+
+
+@cocotb.test()
+async def test_spi_half_frame_ignored(dut):
+    await start(dut, 1, base=[10, 6, 4, 3])
+    # 8 bits of a frame, CS high, then a full frame: only the full one counts
+    await spi_write(dut, frame(2), bits=8)
+    n = 0
+    for _ in range(61):
+        values = await read_digits(dut)
+        expected = [n % 10, n // 10 % 6, n // 60 % 4, n // 240 % 3]
+        assert values == [PATTERNS[e] for e in expected], f"count {n}"
+        dut.ui_in.value = ui(1, 0)
+        await FallingEdge(dut.clk)
+        n += 1
+
+
+@cocotb.test()
+async def test_frame_order(dut):
+    # The frame 0x5432 is digit 3 = 5, digit 2 = 4, digit 1 = 3, digit 0 = 2.
+    # Each digit shows its base - 1 just before it wraps: check via the carry.
+    cocotb.start_soon(Clock(dut.clk, 10, unit="us").start())
+    dut.ena.value = 1
+    dut.ui_in.value = ui(0, 0)
+    dut.uio_in.value = CS
+    dut.rst_n.value = 0
+    await ClockCycles(dut.clk, 5)
+    dut.rst_n.value = 1
+    await FallingEdge(dut.clk)
+    await spi_write(dut, 0x5432)
+    await FallingEdge(dut.clk)
+    n = 0
+    for _ in range(2 * 3 * 4 * 5 + 3):
+        values = await read_digits(dut, en=1)
+        expected = [n % 2, n // 2 % 3, n // 6 % 4, n // 24 % 5]
+        assert values == [PATTERNS[e] for e in expected], f"count {n}"
+        dut.ui_in.value = ui(1, 0)
+        await FallingEdge(dut.clk)
+        n += 1
+
+
+@cocotb.test()
+async def test_clock_10_6_10_6(dut):
+    await start(dut, 1, base=[10, 6, 10, 6])
+    # A clock 00:00 to 59:59 then back to 00:00 (3600 steps, plus two more)
+    for n in range(3602):
+        values = await read_digits(dut)
+        m = n % 3600
+        expected = [m % 10, m // 10 % 6, m // 60 % 10, m // 600 % 6]
+        assert values == [PATTERNS[e] for e in expected], f"count {n}"
+        dut.ui_in.value = ui(1, 0)
+        await FallingEdge(dut.clk)
+    # Seconds just rolled: 59 -> 1:00 was passed at n = 59 -> 60 above
 
 
 @cocotb.test()

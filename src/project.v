@@ -70,41 +70,48 @@ module digit (
 endmodule
 
 // The settings register: written over SPI (mode 0, MSB first), one frame is
-// 8 bits. On the 8th rising SCK edge the low 4 bits of the frame become the
-// count base, the upper 4 bits are ignored. A frame cut short by CS going high
-// changes nothing. Everything here is clocked by SCK, not by clk.
+// 16 bits: the bases of digit 3, 2, 1 and 0, 4 bits each, in this order (the
+// base of digit 0 is the last 4 bits sent). On the 16th rising SCK edge all
+// four bases are taken. A frame cut short by CS going high changes nothing.
+// Everything here is clocked by SCK, not by clk.
 module settings (
     input  wire       sck,    // SPI clock
     input  wire       cs_n,   // SPI chip select, low while a frame is sent
     input  wire       mosi,   // SPI data in
     input  wire       rst_n,  // reset_n - low to reset
-    output reg  [3:0] base    // count base (0 means 16)
+    output reg  [3:0] base0,  // count base of digit 0 (0 means 16)
+    output reg  [3:0] base1,  // count base of digit 1
+    output reg  [3:0] base2,  // count base of digit 2
+    output reg  [3:0] base3   // count base of digit 3
 );
 
   // The bits received so far in this frame, newest in bit 0
-  reg [6:0] shift;
+  reg [14:0] shift;
 
-  // How many bits of this frame have been received (0..7)
-  reg [2:0] bit_count;
+  // How many bits of this frame have been received (0..15)
+  reg [3:0] bit_count;
 
-  // The frame is complete when the 8th bit arrives: 7 bits are already in
+  // The frame is complete when the 16th bit arrives: 15 bits are already in
   // the shift register, and the bit on MOSI is the last one.
   // The counter is held at 0 while CS is high, so a cut-short frame is dropped.
   always @(posedge sck or posedge cs_n) begin
     if (cs_n) begin
-      bit_count <= 3'd0;
+      bit_count <= 4'd0;
     end else begin
-      bit_count <= bit_count + 3'd1;
-      shift     <= {shift[5:0], mosi};
+      bit_count <= bit_count + 4'd1;
+      shift     <= {shift[13:0], mosi};
     end
   end
 
-  // The base takes the low 4 bits of the frame, they are the last 4 bits sent
+  // The four bases are taken together, digit 3 first in the frame
   always @(posedge sck or negedge rst_n) begin
     if (!rst_n) begin
-      base <= 4'd0;
-    end else if (!cs_n && bit_count == 3'd7) begin
-      base <= {shift[2:0], mosi};
+      base0 <= 4'd0;
+      base1 <= 4'd0;
+      base2 <= 4'd0;
+      base3 <= 4'd0;
+    end else if (!cs_n && bit_count == 4'd15) begin
+      {base3, base2, base1, base0} <= {shift, mosi};
     end
   end
 
@@ -133,21 +140,22 @@ module tt_um_cyberhuman_7segment (
   wire mosi = uio_in[1];
   wire sck  = uio_in[3];
 
-  // Counter base for all digits, set over SPI (16 after reset)
-  wire [3:0] base;
-  settings settings0 (.sck, .cs_n, .mosi, .rst_n, .base);
+  // Counter base of each digit, set over SPI (16 after reset)
+  wire [3:0] base0, base1, base2, base3;
+  settings settings0 (.sck, .cs_n, .mosi, .rst_n, .base0, .base1, .base2, .base3);
 
   // Segments and carry-out of each of the four digits
   wire [6:0] seg0, seg1, seg2, seg3;
   wire       co0, co1, co2, co3;
 
-  // Four digits in a chain: together a 16-bit counter 0000..FFFF.
-  // The lowest digit counts when EN is 1, each next digit counts when the
-  // digit before it has a carry-out.
-  digit digit0 (.clk, .rst_n, .en,      .base, .seg(seg0), .co(co0));
-  digit digit1 (.clk, .rst_n, .en(co0), .base, .seg(seg1), .co(co1));
-  digit digit2 (.clk, .rst_n, .en(co1), .base, .seg(seg2), .co(co2));
-  digit digit3 (.clk, .rst_n, .en(co2), .base, .seg(seg3), .co(co3));
+  // Four digits in a chain, each with its own base (16 after reset, so
+  // together a 16-bit counter 0000..FFFF; bases 10, 6, 10, 6 make a clock
+  // 00:00..59:59). The lowest digit counts when EN is 1, each next digit
+  // counts when the digit before it has a carry-out.
+  digit digit0 (.clk, .rst_n, .en,      .base(base0), .seg(seg0), .co(co0));
+  digit digit1 (.clk, .rst_n, .en(co0), .base(base1), .seg(seg1), .co(co1));
+  digit digit2 (.clk, .rst_n, .en(co1), .base(base2), .seg(seg2), .co(co2));
+  digit digit3 (.clk, .rst_n, .en(co2), .base(base3), .seg(seg3), .co(co3));
 
   // The selector: SEL chooses which digit's {co, seg} goes to the output pins.
   // It is plain logic after the flip-flops, so a switch change shows at once,
