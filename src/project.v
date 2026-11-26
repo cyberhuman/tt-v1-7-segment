@@ -68,7 +68,7 @@ module digit (
   // Carry out: high when EN is 1 and the digit is F
   assign co = en & (count + 4'd1 == base);
 
-  // The count is 0 (used to blank leading zeros)
+  // The count is 0 (used by display mode 1)
   assign zero = count == 4'd0;
 
 endmodule
@@ -85,7 +85,7 @@ module settings (
     input  wire       cs_n,   // SPI chip select, low while a write is sent
     input  wire       mosi,   // SPI data in
     input  wire       rst_n,  // reset_n - low to reset
-    output reg  [3:0] pad,    // pad bit of each digit: 1 blanks its leading 0
+    output reg  [7:0] mode,   // display mode of each digit, 2 bits each, digit 0 in bits 1:0
     output reg  [3:0] base0,  // count base of digit 0 (0 means 16)
     output reg  [3:0] base1,  // count base of digit 1
     output reg  [3:0] base2,  // count base of digit 2
@@ -95,7 +95,7 @@ module settings (
   // Register addresses (7 bits, the top bit of the address byte is the read bit)
   localparam [6:0] ADDR_BASE10 = 7'h00;  // {base1, base0}
   localparam [6:0] ADDR_BASE32 = 7'h01;  // {base3, base2}
-  localparam [6:0] ADDR_PAD    = 7'h02;  // {4 unused bits, pad[3:0]}
+  localparam [6:0] ADDR_MODE   = 7'h02;  // {mode3, mode2, mode1, mode0}
 
   // The bits received so far in this write, newest in bit 0
   reg [14:0] shift;
@@ -127,7 +127,7 @@ module settings (
   // address above, an output port and reset value here, and one case line.
   always @(posedge sck or negedge rst_n) begin
     if (!rst_n) begin
-      pad   <= 4'd0;
+      mode  <= 8'd0;
       base0 <= 4'd0;
       base1 <= 4'd0;
       base2 <= 4'd0;
@@ -136,7 +136,7 @@ module settings (
       case (addr)
         ADDR_BASE10: {base1, base0} <= data;
         ADDR_BASE32: {base3, base2} <= data;
-        ADDR_PAD:    pad <= data[3:0];
+        ADDR_MODE:   mode <= data;
         default: ;
       endcase
     end
@@ -167,10 +167,11 @@ module tt_um_cyberhuman_7segment (
   wire mosi = uio_in[1];
   wire sck  = uio_in[3];
 
-  // Pad bit and counter base of each digit, set over SPI (after reset no
-  // digit is blanked and all bases are 16)
-  wire [3:0] pad, base0, base1, base2, base3;
-  settings settings0 (.sck, .cs_n, .mosi, .rst_n, .pad, .base0, .base1, .base2, .base3);
+  // Display mode and counter base of each digit, set over SPI (after reset
+  // every digit is shown as is and all bases are 16)
+  wire [7:0] mode;
+  wire [3:0] base0, base1, base2, base3;
+  settings settings0 (.sck, .cs_n, .mosi, .rst_n, .mode, .base0, .base1, .base2, .base3);
 
   // Segments and carry-out of each of the four digits
   wire [6:0] seg0, seg1, seg2, seg3;
@@ -186,25 +187,28 @@ module tt_um_cyberhuman_7segment (
   digit digit2 (.clk, .rst_n, .en(co1), .base(base2), .seg(seg2), .co(co2), .zero(zero2));
   digit digit3 (.clk, .rst_n, .en(co2), .base(base3), .seg(seg3), .co(co3), .zero(zero3));
 
-  // A digit is blanked while its pad bit is 1 and it and every digit above
-  // it are 0 (a leading zero). Digit 3 depends only on itself. CO is not
-  // affected.
-  wire blank0 = pad[0] & zero0 & zero1 & zero2 & zero3;
-  wire blank1 = pad[1] & zero1 & zero2 & zero3;
-  wire blank2 = pad[2] & zero2 & zero3;
-  wire blank3 = pad[3] & zero3;
+  // What each digit shows, by its 2-bit display mode (the segments only, CO
+  // is not affected): 0 = the digit as is, 1 = the digit unless its own
+  // count is 0, 2 = nothing, 3 = a minus (segment G only).
+  function [6:0] apply_mode(input [1:0] m, input [6:0] seg, input zero);
+    case (m)
+      2'd0: apply_mode = seg;
+      2'd1: apply_mode = zero ? 7'd0 : seg;
+      2'd2: apply_mode = 7'd0;
+      2'd3: apply_mode = 7'b1000000;
+    endcase
+  endfunction
 
   // The selector: SEL chooses which digit's {co, seg} goes to the output pins.
   // It is plain logic after the flip-flops, so a switch change shows at once,
-  // without a clock edge. CO is the top bit, the segments are the lower seven;
-  // a blanked digit shows all segments off.
+  // without a clock edge. CO is the top bit, the segments are the lower seven.
   reg [7:0] shown;
   always @(*) begin
     case (sel)
-      2'd0: shown = {co0, blank0 ? 7'd0 : seg0};
-      2'd1: shown = {co1, blank1 ? 7'd0 : seg1};
-      2'd2: shown = {co2, blank2 ? 7'd0 : seg2};
-      2'd3: shown = {co3, blank3 ? 7'd0 : seg3};
+      2'd0: shown = {co0, apply_mode(mode[1:0], seg0, zero0)};
+      2'd1: shown = {co1, apply_mode(mode[3:2], seg1, zero1)};
+      2'd2: shown = {co2, apply_mode(mode[5:4], seg2, zero2)};
+      2'd3: shown = {co3, apply_mode(mode[7:6], seg3, zero3)};
     endcase
   end
 

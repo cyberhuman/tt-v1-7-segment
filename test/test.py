@@ -6,6 +6,7 @@ from cocotb.clock import Clock
 from cocotb.triggers import ClockCycles, FallingEdge, Timer
 
 # Segment patterns {g,f,e,d,c,b,a} for the digits 0..F
+MINUS = 0x40  # segment G only
 PATTERNS = [0x3F, 0x06, 0x5B, 0x4F, 0x66, 0x6D, 0x7D, 0x07,
             0x7F, 0x6F, 0x77, 0x7C, 0x39, 0x5E, 0x79, 0x71]
 
@@ -21,7 +22,7 @@ SPI_HALF = 100  # ns, half of one SCK period
 
 
 # Register addresses
-BASE10, BASE32, PAD = 0x00, 0x01, 0x02
+BASE10, BASE32, MODE = 0x00, 0x01, 0x02
 
 
 async def spi_clock_bits(dut, value, bits):
@@ -56,21 +57,22 @@ async def spi_write(dut, address, value, bits=16):
     await spi_writes(dut, (address, value), bits=bits)
 
 
-async def write_settings(dut, base=0, pad=0):
-    # Write the bases and the pad bits. base is one number for all digits, or
-    # a list of four (digit 0 first); pad is the 4 pad bits (bit n is digit n).
+async def write_settings(dut, base=0, mode=0):
+    # Write the bases and the modes. base is one number for all digits, or a
+    # list of four (digit 0 first); mode is the MODE register value (2 bits
+    # per digit, digit 0 in bits 1:0).
     bases = list(base) if isinstance(base, (list, tuple)) else [base] * 4
     assert len(bases) == 4
     await spi_writes(dut,
                      (BASE10, (bases[1] & 0xF) << 4 | bases[0] & 0xF),
                      (BASE32, (bases[3] & 0xF) << 4 | bases[2] & 0xF),
-                     (PAD, pad & 0xF))
+                     (MODE, mode & 0xFF))
 
 
-async def start(dut, en, sel=0, base=None, pad=0):
+async def start(dut, en, sel=0, base=None, mode=0):
     # Start the clock, hold reset for a few cycles, then release it.
     # base is one number for all digits, or a list of four (digit 0 first).
-    # pad is the 4 pad bits (bit n is digit n), written with the bases.
+    # mode is the MODE register value, written with the bases.
     cocotb.start_soon(Clock(dut.clk, 10, unit="us").start())
     dut.ena.value = 1
     dut.ui_in.value = ui(en, sel)
@@ -82,9 +84,9 @@ async def start(dut, en, sel=0, base=None, pad=0):
     await FallingEdge(dut.clk)
     # Reset clears the registers, so they are written after reset. EN is held
     # at 0 during the write and one clock cycle, so the count stays at 0.
-    if base is not None or pad:
+    if base is not None or mode:
         dut.ui_in.value = ui(0, sel)
-        await write_settings(dut, 0 if base is None else base, pad)
+        await write_settings(dut, 0 if base is None else base, mode)
         await FallingEdge(dut.clk)
         dut.ui_in.value = ui(en, sel)
 
@@ -279,30 +281,42 @@ async def test_base_default_16(dut):
 
 async def read_settings(dut, clocks=400):
     # Read the settings back through the display: count with EN = 1 for more
-    # than one full cycle and look at all four digits each clock. The base of
-    # a digit is the highest value it reaches + 1; its pad bit is set if it
-    # is ever blank. Only meaningful when every base is 2..4 (so the whole
-    # cycle is short). Returns (bases of digit 0..3, pad).
+    # than one full cycle and look at all four digits each clock. Only
+    # meaningful when every base is 2..4 (so the whole cycle is short).
+    # Returns (bases of digit 0..3, MODE value). A digit that is always blank
+    # is mode 2, always a minus is mode 3, blank at some count is mode 1,
+    # else mode 0. The base of a digit in mode 2 or 3 cannot be seen: None.
+    # Otherwise it is the highest value the digit reaches + 1.
+    seen = [set() for _ in range(4)]
     highest = [0] * 4
-    pad = 0
     for _ in range(clocks):
         for d, v in enumerate(await read_digits(dut)):
-            if v == 0:
-                pad |= 1 << d
-            else:
+            seen[d].add(v)
+            if v in PATTERNS:
                 highest[d] = max(highest[d], PATTERNS.index(v))
         dut.ui_in.value = ui(1, 0)
         await FallingEdge(dut.clk)
-    return [h + 1 for h in highest], pad
+    bases, mode = [], 0
+    for d in range(4):
+        if seen[d] == {0}:
+            m = 2
+        elif seen[d] == {MINUS}:
+            m = 3
+        else:
+            m = 1 if 0 in seen[d] else 0
+        mode |= m << (2 * d)
+        bases.append(None if m >= 2 else highest[d] + 1)
+    return bases, mode
 
 
-# Settings every register test starts from: all bases 2 and pad 0b0101. The
-# tests only raise bases, so the running count never ends up above a base.
-PRESET = ([2, 2, 2, 2], 0b0101)
+# Settings every register test starts from: all bases 2, modes 1, 0, 1, 0
+# (digit 0 first). The tests only raise bases, so the running count never
+# ends up above a base.
+PRESET = ([2, 2, 2, 2], 0b00_01_00_01)
 
 
 async def start_preset(dut):
-    await start(dut, 0, base=PRESET[0], pad=PRESET[1])
+    await start(dut, 0, base=PRESET[0], mode=PRESET[1])
     assert await read_settings(dut) == PRESET
 
 
@@ -310,21 +324,23 @@ async def start_preset(dut):
 async def test_write_base10_alone(dut):
     await start_preset(dut)
     await spi_write(dut, BASE10, 0x43)       # base1 = 4, base0 = 3
-    assert await read_settings(dut) == ([3, 4, 2, 2], 0b0101)
+    assert await read_settings(dut) == ([3, 4, 2, 2], PRESET[1])
 
 
 @cocotb.test()
 async def test_write_base32_alone(dut):
     await start_preset(dut)
     await spi_write(dut, BASE32, 0x43)       # base3 = 4, base2 = 3
-    assert await read_settings(dut) == ([2, 2, 3, 4], 0b0101)
+    assert await read_settings(dut) == ([2, 2, 3, 4], PRESET[1])
 
 
 @cocotb.test()
-async def test_write_pad_alone(dut):
+async def test_write_mode_alone(dut):
     await start_preset(dut)
-    await spi_write(dut, PAD, 0xFA)          # upper 4 bits unused, pad = 1010
-    assert await read_settings(dut) == ([2, 2, 2, 2], 0b1010)
+    await spi_write(dut, MODE, 0x44)         # modes 0, 1, 0, 1
+    assert await read_settings(dut) == ([2, 2, 2, 2], 0x44)
+    await spi_write(dut, MODE, 0xE4)         # modes 0, 1, 2, 3
+    assert await read_settings(dut) == ([2, 2, None, None], 0xE4)
 
 
 @cocotb.test()
@@ -339,11 +355,11 @@ async def test_nibble_order(dut):
 @cocotb.test()
 async def test_two_writes_one_cs_low(dut):
     await start_preset(dut)
-    await spi_writes(dut, (BASE10, 0x33), (PAD, 0x03))
-    assert await read_settings(dut) == ([3, 3, 2, 2], 0b0011)
+    await spi_writes(dut, (BASE10, 0x33), (MODE, 0x05))
+    assert await read_settings(dut) == ([3, 3, 2, 2], 0x05)
     # Three in a row, the last one to the same register wins
     await spi_writes(dut, (BASE32, 0x43), (BASE10, 0x33), (BASE10, 0x44))
-    assert await read_settings(dut) == ([4, 4, 3, 4], 0b0011)
+    assert await read_settings(dut) == ([4, 4, 3, 4], 0x05)
 
 
 @cocotb.test()
@@ -352,11 +368,11 @@ async def test_cut_short_write_ignored(dut):
     for bits in (8, 15):
         # An address and data that would change everything, cut short
         await spi_write(dut, BASE10, 0x43, bits=bits)
-        await spi_write(dut, PAD, 0x0F, bits=bits)
+        await spi_write(dut, MODE, 0x0F, bits=bits)
         assert await read_settings(dut) == PRESET, f"{bits} bits"
     # A cut-short write does not leave bits behind: a full write still works
     await spi_write(dut, BASE10, 0x43)
-    assert await read_settings(dut) == ([3, 4, 2, 2], 0b0101)
+    assert await read_settings(dut) == ([3, 4, 2, 2], PRESET[1])
 
 
 @cocotb.test()
@@ -364,14 +380,14 @@ async def test_cut_short_then_full_same_cs(dut):
     await start_preset(dut)
     # 8 bits, CS high, then a full write: the 8 bits are not carried over
     await spi_write(dut, BASE32, 0x33, bits=8)
-    await spi_write(dut, PAD, 0x0A)
-    assert await read_settings(dut) == ([2, 2, 2, 2], 0b1010)
+    await spi_write(dut, MODE, 0x44)
+    assert await read_settings(dut) == ([2, 2, 2, 2], 0x44)
 
 
 @cocotb.test()
 async def test_read_bit_set_ignored(dut):
     await start_preset(dut)
-    for address in (0x80 | BASE10, 0x80 | BASE32, 0x80 | PAD, 0xFF):
+    for address in (0x80 | BASE10, 0x80 | BASE32, 0x80 | MODE, 0xFF):
         await spi_write(dut, address, 0x33)
     assert await read_settings(dut) == PRESET
 
@@ -383,7 +399,7 @@ async def test_unused_address_ignored(dut):
         await spi_write(dut, address, 0x33)
     assert await read_settings(dut) == PRESET
     # The address is decoded in full: a register address with a high bit set
-    for address in (0x40 | BASE10, 0x20 | PAD, 0x10 | BASE32):
+    for address in (0x40 | BASE10, 0x20 | MODE, 0x10 | BASE32):
         await spi_write(dut, address, 0x33)
     assert await read_settings(dut) == PRESET
 
@@ -392,7 +408,7 @@ async def test_unused_address_ignored(dut):
 async def test_spi_cs_high_ignored(dut):
     await start_preset(dut)
     # SCK edges with CS high: two full writes worth of clocks, valid writes
-    for value in (BASE10 << 8 | 0x43, PAD << 8 | 0x0F):
+    for value in (BASE10 << 8 | 0x43, MODE << 8 | 0x0F):
         for i in range(16):
             bit = (value >> (15 - i)) & 1
             dut.uio_in.value = CS | bit * MOSI | SCK
@@ -423,81 +439,103 @@ async def step(dut, n=1):
         await FallingEdge(dut.clk)
 
 
-@cocotb.test()
-async def test_pad_blank_leading(dut):
-    await start(dut, 1, base=10, pad=0b1110)
-    # 0000: digit 0 is not padded and shows 0, digits 1..3 are blank
-    assert await read_digits(dut) == [PATTERNS[0], 0, 0, 0]
-    await step(dut, 5)
-    # 0005: digit 0 lit, digits 1..3 blank
-    assert await read_digits(dut) == [PATTERNS[5], 0, 0, 0]
-    await step(dut, 100)
-    # 0105: digit 1 is a 0 that is not leading and shows, digit 3 is blank
-    assert await read_digits(dut) == [PATTERNS[5], PATTERNS[0], PATTERNS[1], 0]
-    await step(dut, 899)
-    # 1004: digit 3 is not 0, so nothing is blank
-    assert await read_digits(dut) == [PATTERNS[4], PATTERNS[0], PATTERNS[0], PATTERNS[1]]
+async def lit(dut, sel):
+    # uo_out[6:0] of one digit
+    dut.ui_in.value = ui(1, sel)
+    await Timer(1, unit="us")
+    return int(dut.uo_out.value) & 0x7F
 
 
 @cocotb.test()
-async def test_pad_blank_all(dut):
-    await start(dut, 1, base=10, pad=0b1111)
-    # 0000 is all blank, 0001 shows the 1 only
+async def test_mode1_blank_own_zero(dut):
+    await start(dut, 1, base=10, mode=0x55)
+    # 0000: every digit is 0 and blank
     assert await read_digits(dut) == [0, 0, 0, 0]
+    await step(dut, 105)
+    # 0105: digits 0 and 2 lit, digits 1 and 3 are 0 and blank (no chain)
+    assert await read_digits(dut) == [PATTERNS[5], 0, PATTERNS[1], 0]
+
+
+@cocotb.test()
+async def test_mode1_follows_count(dut):
+    await start(dut, 1, base=10, mode=0x01)
+    assert await lit(dut, 0) == 0
     await step(dut)
-    assert await read_digits(dut) == [PATTERNS[1], 0, 0, 0]
+    assert await lit(dut, 0) == PATTERNS[1], "lit when it leaves 0"
+    await step(dut, 9)
+    assert await lit(dut, 0) == 0, "blank when it returns to 0"
+    await step(dut, 3)
+    assert await lit(dut, 0) == PATTERNS[3]
 
 
 @cocotb.test()
-async def test_pad_with_base_16(dut):
-    # Bases 0 (= 16) with all pad bits: 0000 blank, 0010 keeps digit 0 lit
-    await start(dut, 1, pad=0b1111)
-    assert await read_digits(dut) == [0, 0, 0, 0]
-    await step(dut, 16)
-    assert await read_digits(dut) == [PATTERNS[0], PATTERNS[1], 0, 0]
-
-
-@cocotb.test()
-async def test_pad_bit_clear_keeps_zero(dut):
-    # Pad bits on digits 3 and 1 only: digit 2 keeps its 0, digit 1 is blank
-    # while digits 2 and 3 are 0 (digit 2 is, so blank)
-    await start(dut, 1, base=10, pad=0b1010)
-    assert await read_digits(dut) == [PATTERNS[0], 0, PATTERNS[0], 0]
-    await step(dut, 100)
-    # 0100: digit 2 is 1, so digit 1 (a 0 that is not leading) shows
-    assert await read_digits(dut) == [PATTERNS[0], PATTERNS[0], PATTERNS[1], 0]
-
-
-@cocotb.test()
-async def test_pad_digit3_alone(dut):
-    # Digit 3 depends only on itself: pad bit 3 blanks it while it is 0
-    await start(dut, 1, base=10, pad=0b1000)
+async def test_mode2_blank(dut):
+    await start(dut, 1, base=10, mode=0xAA)
     await step(dut, 37)
-    assert await read_digits(dut) == [PATTERNS[7], PATTERNS[3], PATTERNS[0], 0]
+    assert await read_digits(dut) == [0, 0, 0, 0]
 
 
 @cocotb.test()
-async def test_pad_co_unchanged(dut):
-    # Base 1 on digit 0: it stays 0 and CO is high with EN = 1. Digit 0 is
-    # blank (pad bit set), CO still follows EN.
-    await start(dut, 1, base=[1, 10, 10, 10], pad=0b1111)
-    dut.ui_in.value = ui(1, 0)
-    await Timer(1, unit="us")
-    assert dut.uo_out.value == 0x80, "blank digit with CO high"
-    dut.ui_in.value = ui(0, 0)
-    await Timer(1, unit="us")
-    assert dut.uo_out.value == 0x00, "blank digit with CO low"
+async def test_mode3_minus(dut):
+    await start(dut, 1, base=10, mode=0xFF)
+    for _ in range(3):
+        # 0000 first, then non-zero counts
+        assert await read_digits(dut) == [MINUS] * 4
+        await step(dut, 7)
+    await step(dut, 100)
+    assert await read_digits(dut) == [MINUS] * 4
+
+
+@cocotb.test()
+async def test_modes_differ_per_digit(dut):
+    # Digit 0 mode 3, digit 1 mode 2, digit 2 mode 1, digit 3 mode 0
+    await start(dut, 1, base=10, mode=0b00_01_10_11)
+    assert await read_digits(dut) == [MINUS, 0, 0, PATTERNS[0]]
+    await step(dut, 235)
+    assert await read_digits(dut) == [MINUS, 0, PATTERNS[2], PATTERNS[0]]
+    await step(dut, 765)
+    # 1000: digit 3 shows 1, digit 2 is 0 and blank
+    assert await read_digits(dut) == [MINUS, 0, 0, PATTERNS[1]]
+    # The other way round: digit 0 mode 0, 1 mode 1, 2 mode 2, 3 mode 3
+    await start(dut, 1, base=10, mode=0b11_10_01_00)
+    await step(dut, 1)
+    assert await read_digits(dut) == [PATTERNS[1], 0, 0, MINUS]
+
+
+@cocotb.test()
+async def test_co_same_in_all_modes(dut):
+    # Base 1 on digit 0: it stays 0 and CO is high with EN = 1
+    for m in range(4):
+        await start(dut, 1, base=[1, 10, 10, 10], mode=m * 0x55)
+        for en, co in ((1, 0x80), (0, 0)):
+            dut.ui_in.value = ui(en, 0)
+            await Timer(1, unit="us")
+            assert int(dut.uo_out.value) & 0x80 == co, f"mode {m} en {en}"
+        dut.rst_n.value = 0
+        await ClockCycles(dut.clk, 2)
+        dut.rst_n.value = 1
+
+
+@cocotb.test()
+async def test_mode_does_not_disturb_count(dut):
+    await start(dut, 1, base=10, mode=0)
+    await step(dut, 3)
+    await spi_write(dut, MODE, 0x02)         # digit 0 to mode 2
+    await step(dut, 4)
+    assert await lit(dut, 0) == 0
+    await spi_write(dut, MODE, 0x00)         # still before the next clock edge
+    assert int(dut.uo_out.value) & 0x7F == PATTERNS[7]
 
 
 @cocotb.test()
 async def test_reset_clears_registers(dut):
-    await start(dut, 1, base=[2, 3, 4, 2], pad=0b1111)
-    assert await read_digits(dut) == [0, 0, 0, 0]
+    await start(dut, 1, base=[2, 3, 4, 2], mode=0xFF)
+    assert await read_digits(dut) == [MINUS] * 4
     dut.rst_n.value = 0
     await ClockCycles(dut.clk, 3)
     dut.rst_n.value = 1
     await FallingEdge(dut.clk)
-    # Pad bits cleared: nothing is blank
+    # Modes cleared: every digit is shown as is
     assert await read_digits(dut) == [PATTERNS[0]] * 4
     # All bases are 16: after 16**3 clocks the count is 1000, not earlier
     await step(dut, 0x1000 - 1)
