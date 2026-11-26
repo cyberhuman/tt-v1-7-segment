@@ -26,9 +26,13 @@ carry-out of the digit or its inverse. The display shows one digit at a time.
   modes 1 to 3. INC counts up and DEC counts down, each when it is released:
   the step comes on the falling edge of the pin, not while it is held high.
   `clk` does not count then. Use one at a time: pressing both together is not
-  defined. In mode 0 INC and DEC are ignored.
-- `uio[4]` and `uio[5]` are **SEL0** and **SEL1**: they pick the digit shown,
-  0 = lowest, 3 = highest. A change shows at once, without a clock edge.
+  defined. INC and DEC pulses, and the gaps between them, should be at
+  least 100 ns. In mode 0 INC and DEC are ignored.
+- `uio[4]` and `uio[5]` are **SEL0** and **SEL1** in the count modes 0 and 1:
+  inputs that pick the digit shown, 0 = lowest, 3 = highest. A change shows at
+  once, without a clock edge. In the modes 2 and 3 the chip picks the digit
+  itself and these pins, with `uio[6]` and `uio[7]`, are outputs: **DIG0** to
+  **DIG3** (below).
 - `uo[0]` to `uo[6]` drive the segments A to G (active high) of the digit shown.
 - `uo[7]` is **DP**, the decimal point of the digit shown. Its DOT value
   (below) makes it off, on, the carry-out CO of that digit, or the inverse of
@@ -76,8 +80,8 @@ not apply: INC counts up and DEC counts down.
 Count mode (CTRL bits 1:0): in mode 0 the counter is clocked by `clk`, as
 before, CTRL bit 2 gives the direction, and INC and DEC are ignored. In modes
 1, 2 and 3 INC (`ui[1]`) counts up and DEC (`ui[2]`) counts down, each when it
-is released, and `clk` does not count. For now modes 2 and 3 are the same as
-mode 1. The counter has one clock, and the direction must be settled before
+is released, and `clk` does not count. Modes 2 and 3 also scan the display (below).
+The counter has one clock, and the direction must be settled before
 the counting edge, so the step comes on release: DEC sets a direction flip-flop
 when it is pressed, INC clears it, and the counter clock is high only while
 both are low. The count mode is not glitch-free: a write to it may make one
@@ -93,6 +97,27 @@ both registers before one edge loads all four digits on that edge. A digit that
 loads has no carry-out on that edge, and a value at or above the base is taken
 as is. Reset clears the written values, so it never causes a load.
 
+Scan (modes 2 and 3): a 2-bit scan counter steps 0, 1, 2, 3, 0 on every
+rising edge of `clk`, whatever EN is, and the digit it names is the one on
+`uo`. `uio[5:4]` are ignored then. The counter holds in modes 0 and 1 and
+carries on from where it was; reset clears it. Counting is unchanged: INC and
+DEC count, `clk` does not. The scan counter takes the mode from the SPI side
+without a synchroniser, like the other settings.
+
+- Mode 2: the scan number is on `uio[5:4]` (`uio[4]` is the low bit) and
+  `uio[7:6]` read 0. `uio_oe` is 0x30. Wire a 2-to-4 decoder (or a 74HC139)
+  from `uio[5:4]` to the four digit commons.
+- Mode 3: one line per digit on `uio[7:4]`, active high: `uio[4]` is digit 0 and
+  `uio[7]` is digit 3, one high at a time. `uio_oe` is 0xF0. Drive the digit
+  commons from them, through a transistor for each (or use them directly on
+  common-cathode digits with a resistor in each segment line).
+- Modes 0 and 1: `uio_oe` is 0 and nothing is driven. `uio[3:0]` (SPI) are never
+  outputs.
+
+Bit 7 (DP) follows the dot value of the digit scanned. `clk` is the scan rate:
+run it at about 1 kHz or more so the four digits look steady, or at 1 Hz to
+watch them one by one.
+
 Dot values: 0 is off (bit 7 low), 1 is on (bit 7 high), 2 is CO, 3 is the
 inverse of CO. The reset value of DOT is 0xAA.
 
@@ -104,8 +129,10 @@ inverse of CO. The reset value of DOT is 0xAA.
 | uio[0] | CS | in | SPI chip select, active low |
 | uio[1] | MOSI | in | SPI data in |
 | uio[3] | SCK | in | SPI clock |
-| uio[4] | SEL0 | in | digit select, low bit |
-| uio[5] | SEL1 | in | digit select, high bit |
+| uio[4] | SEL0 / DIG0 | in / out | digit select low bit (modes 0, 1); scan number low bit (mode 2) or digit 0 line (mode 3) |
+| uio[5] | SEL1 / DIG1 | in / out | digit select high bit (modes 0, 1); scan number high bit (mode 2) or digit 1 line (mode 3) |
+| uio[6] | DIG2 | out | digit 2 line, mode 3 only |
+| uio[7] | DIG3 | out | digit 3 line, mode 3 only |
 | uo[0] | A | out | segment A |
 | uo[1] | B | out | segment B |
 | uo[2] | C | out | segment C |
@@ -116,7 +143,7 @@ inverse of CO. The reset value of DOT is 0xAA.
 | uo[7] | DP | out | decimal point of the digit shown (CO by default) |
 
 Clock and reset are the dedicated `clk` and `rst_n` pins. The other `ui` pins
-and `uio` pins are unused; `uio[2]` is kept for MISO and is not driven.
+are unused; `uio[2]` is kept for MISO and is not driven.
 
 ## How to test
 
@@ -138,6 +165,12 @@ and `uio` pins are unused; `uio[2]` is kept for MISO and is not driven.
 ## External hardware
 
 A 7-segment display on `uo[0]` to `uo[7]` (active high), switches for EN
-(`ui[0]`), push buttons for INC and DEC (`ui[1]`, `ui[2]`) and SEL (`uio[4]`, `uio[5]`), an SPI controller (for example the
+(`ui[0]`), push buttons for INC and DEC (`ui[1]`, `ui[2]`) and SEL (`uio[4]`, `uio[5]`; outputs in the modes 2 and 3), an SPI controller (for example the
 RP2040 on the demo board) on `uio[0]`, `uio[1]` and `uio[3]`, and a slow clock
 source or a push button on `clk`.
+
+For a four-digit multiplexed display, set the mode to 2 or 3 and put the four
+digits' segment pins in parallel on `uo[0]` to `uo[7]`. Mode 2: a 2-to-4
+decoder on `uio[5:4]` picks the digit common. Mode 3: wire `uio[4]` to `uio[7]`
+straight to the digit commons, 0 to 3 (through transistors if the
+segments draw more than the pins give).

@@ -10,17 +10,19 @@ create_clock {*}$port_args -name $clock_port -period $::env(CLOCK_PERIOD)
 set sck_port [get_ports {uio_in[3]}]
 create_clock $sck_port -name sck -period 100
 
-# The counter clock INC is on ui_in[1]. It is a third clock, 100 ns period,
+# The counter clock INC is on ui_in[1]. It is a third clock, 200 ns period,
 # asynchronous to clk and sck. It clocks the counter in the count modes 1 to 3.
+# The period stands for the shortest INC or DEC pulse, and the shortest gap
+# between pulses, that the checks assume: 100 ns each.
 set inc_port [get_ports {ui_in[1]}]
-create_clock $inc_port -name inc -period 100
+create_clock $inc_port -name inc -period 200
 
-# The counter clock DEC is on ui_in[2]: a fourth clock, 100 ns period, asynchronous
+# The counter clock DEC is on ui_in[2]: a fourth clock, 200 ns period, asynchronous
 # to the others, treated like inc. It sets the direction flip-flop. The paths from that
 # flip-flop to the counter are between unrelated clocks by this definition; they are
 # separated by the pulse width of INC and DEC, not by STA.
 set dec_port [get_ports {ui_in[2]}]
-create_clock $dec_port -name dec -period 100
+create_clock $dec_port -name dec -period 200
 
 set_clock_groups -asynchronous -group [get_clocks $clock_port] -group [get_clocks sck] -group [get_clocks inc] -group [get_clocks dec]
 

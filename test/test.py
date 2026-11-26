@@ -163,8 +163,26 @@ def shown(digit, co=0):
     return PATTERNS[digit] | (0x80 if co else 0)
 
 
+def scan_index(dut):
+    # The digit the chip shows in the modes 2 and 3, read from uio_out
+    out = int(dut.uio_out.value)
+    if int(dut.uio_oe.value) == 0xF0:  # mode 3: one line per digit
+        assert (out >> 4) in (1, 2, 4, 8), f"uio_out {out:#x}"
+        return [1, 2, 4, 8].index(out >> 4)
+    return out >> 4 & 3  # mode 2: a number
+
+
 async def read_digits(dut, en=1):
-    # Read all four digits (lowest first) by switching SEL, no clock edge needed
+    # Read all four digits (lowest first): by switching SEL, no clock edge
+    # needed; in the modes 2 and 3 (uio_oe not 0) by watching the scan for
+    # four clock edges
+    if int(dut.uio_oe.value) != 0:
+        drive(dut, en, 0)
+        values = [None] * 4
+        for _ in range(4):
+            await FallingEdge(dut.clk)
+            values[scan_index(dut)] = int(dut.uo_out.value) & 0x7F
+        return values
     values = []
     for sel in range(4):
         drive(dut, en, sel)
@@ -508,6 +526,8 @@ async def step(dut, n=1):
 
 async def lit(dut, sel):
     # uo_out[6:0] of one digit
+    if int(dut.uio_oe.value) != 0:
+        return (await read_digits(dut))[sel]
     drive(dut, 1, sel)
     await Timer(1, unit="us")
     return int(dut.uo_out.value) & 0x7F
@@ -1473,3 +1493,174 @@ async def test_reset_returns_mode0(dut):
     await FallingEdge(dut.clk)
     await press(dut, "IDID")
     assert await lit(dut, 0) == PATTERNS[3], "INC and DEC ignored after reset"
+
+
+# Modes 2 and 3: the chip scans the digits on clk and drives the select out
+
+async def scan_trace(dut, n, en=1):
+    # n falling edges of clk: (uio_oe, uio_out, uo_out) after each
+    drive(dut, en, 0)
+    trace = []
+    for _ in range(n):
+        await FallingEdge(dut.clk)
+        trace.append((int(dut.uio_oe.value), int(dut.uio_out.value), int(dut.uo_out.value)))
+    return trace
+
+
+async def preset(dut, mode, values=(0x1, 0x2, 0x3, 0x4), dot=DOT_RESET, ctrl=0):
+    # Reset, then four different digits loaded in mode 0 (one clk edge), the dot
+    # values, then the mode
+    await start(dut, 0, dot=dot)
+    drive(dut, 0, 0)
+    await spi_write(dut, COUNT10, values[1] << 4 | values[0])
+    await spi_write(dut, COUNT32, values[3] << 4 | values[2])
+    await FallingEdge(dut.clk)
+    await FallingEdge(dut.clk)
+    await set_mode(dut, mode, ctrl)
+
+
+@cocotb.test()
+async def test_scan_pins_in_each_mode(dut):
+    await start(dut, 1)
+    for mode, oe in ((0, 0x00), (1, 0x00), (2, 0x30), (3, 0xF0)):
+        await set_mode(dut, mode)
+        for oe_now, out, _ in await scan_trace(dut, 5):
+            assert oe_now == oe, f"uio_oe in mode {mode}"
+            if mode < 2:
+                assert out == 0, f"uio_out in mode {mode}"
+            else:
+                assert out & 0x0F == 0, f"uio_out[3:0] in mode {mode}"
+                if mode == 2:
+                    assert out & 0xC0 == 0, "uio_out[7:6] in mode 2"
+
+
+@cocotb.test()
+async def test_scan_mode2(dut):
+    await preset(dut, 2)
+    trace = await scan_trace(dut, 9)
+    first = (trace[0][1] >> 4) & 3
+    for i, (oe, out, uo) in enumerate(trace):
+        want = (first + i) % 4
+        assert oe == 0x30 and out == want << 4, f"edge {i}: {out:#x}"
+        assert uo == shown(want + 1), f"edge {i}: uo {uo:#x}"
+    assert sorted({(t[1] >> 4) for t in trace}) == [0, 1, 2, 3]
+
+
+@cocotb.test()
+async def test_scan_mode3(dut):
+    await preset(dut, 3)
+    trace = await scan_trace(dut, 9)
+    first = [1, 2, 4, 8].index(trace[0][1] >> 4)
+    for i, (oe, out, uo) in enumerate(trace):
+        want = (first + i) % 4
+        assert oe == 0xF0 and out == (1 << want) << 4, f"edge {i}: {out:#x}"
+        assert uo == shown(want + 1), f"edge {i}: uo {uo:#x}"
+
+
+@cocotb.test()
+async def test_scan_one_step_per_clk_edge(dut):
+    await preset(dut, 2)
+    await FallingEdge(dut.clk)
+    before = int(dut.uio_out.value) >> 4 & 3
+    await RisingEdge(dut.clk)
+    await Timer(1, unit="us")
+    assert int(dut.uio_out.value) >> 4 & 3 == (before + 1) % 4
+    await Timer(3, unit="us")  # clk still high: no second step
+    assert int(dut.uio_out.value) >> 4 & 3 == (before + 1) % 4
+    await FallingEdge(dut.clk)
+    assert int(dut.uio_out.value) >> 4 & 3 == (before + 1) % 4
+
+
+@cocotb.test()
+async def test_scan_ignores_sel_pins(dut):
+    for mode in (2, 3):
+        await preset(dut, mode)
+        for sel in range(4):
+            drive(dut, 1, sel)
+            for _ in range(4):
+                await FallingEdge(dut.clk)
+                scan = scan_index(dut)
+                assert int(dut.uo_out.value) & 0x7F == PATTERNS[scan + 1], f"mode {mode} sel {sel}"
+
+
+@cocotb.test()
+async def test_scan_holds_in_modes_0_1_and_continues(dut):
+    # Leave mode 2 (or 3) for mode 1 or 0 with clk running: the scan holds and
+    # continues from where it was when the mode returns
+    for held_mode in (1, 0):
+        for scan_mode in (2, 3):
+            await preset(dut, scan_mode)
+            await FallingEdge(dut.clk)
+            s0 = scan_index(dut)
+            await set_mode(dut, held_mode)  # the edge before the write still steps
+            assert int(dut.uio_oe.value) == 0 and int(dut.uio_out.value) == 0
+            await ClockCycles(dut.clk, 7)
+            await set_mode(dut, scan_mode)  # the edge before this write is held
+            assert scan_index(dut) == (s0 + 1) % 4, f"{held_mode} -> {scan_mode}"
+            await FallingEdge(dut.clk)
+            assert scan_index(dut) == (s0 + 2) % 4, f"{held_mode} -> {scan_mode}"
+
+
+@cocotb.test()
+async def test_scan_not_stopped_by_en(dut):
+    await preset(dut, 2)
+    trace = await scan_trace(dut, 8, en=0)
+    outs = [t[1] >> 4 for t in trace]
+    assert all((b - a) % 4 == 1 for a, b in zip(outs, outs[1:])), outs
+    assert sorted(set(outs)) == [0, 1, 2, 3]
+
+
+@cocotb.test()
+async def test_scan_with_inc_and_dec(dut):
+    for mode in (2, 3):
+        await start_mode(dut, mode)
+        await step(dut, 5)
+        await check_digits(dut, [0, 0, 0, 0], f"clk does not count, mode {mode}")
+        await inc_pulses(dut, 3)
+        await check_digits(dut, [3, 0, 0, 0], f"INC, mode {mode}")
+        await dec_pulses(dut, 1)
+        await check_digits(dut, [2, 0, 0, 0], f"DEC, mode {mode}")
+        out = [t[1] for t in await scan_trace(dut, 4)]
+        assert len(set(out)) == 4, f"scan keeps running, mode {mode}"
+
+
+@cocotb.test()
+async def test_scan_dot_follows_scanned_digit(dut):
+    # DOT: digit 0 off, 1 on, 2 off, 3 on
+    await preset(dut, 2, dot=0b01000100)
+    for _, out, uo in await scan_trace(dut, 8):
+        scan = out >> 4 & 3
+        assert uo >> 7 == (scan % 2), f"digit {scan}: uo {uo:#x}"
+        assert uo & 0x7F == PATTERNS[scan + 1]
+
+
+@cocotb.test()
+async def test_scan_spi_write_while_scanning(dut):
+    await preset(dut, 3)
+    drive(dut, 0, 0)
+    await spi_write(dut, MODE, 0b00_10_00_00)  # digit 2 shows nothing
+    for _, out, uo in await scan_trace(dut, 8, en=0):
+        scan = [1, 2, 4, 8].index(out >> 4)
+        assert uo & 0x7F == (0 if scan == 2 else PATTERNS[scan + 1]), f"digit {scan}"
+    await spi_write(dut, BASE10, 0x00)
+    out = [t[1] for t in await scan_trace(dut, 4)]
+    assert len(set(out)) == 4
+
+
+@cocotb.test()
+async def test_scan_reset(dut):
+    await preset(dut, 3)
+    await ClockCycles(dut.clk, 2)
+    dut.rst_n.value = 0
+    await Timer(1, unit="us")
+    assert int(dut.uio_oe.value) == 0, "uio_oe low in reset"
+    await ClockCycles(dut.clk, 2)
+    dut.rst_n.value = 1
+    await FallingEdge(dut.clk)
+    assert int(dut.uio_oe.value) == 0 and int(dut.uio_out.value) == 0
+    # Mode 2 again: the scan starts from 0
+    await set_mode(dut, 2)
+    first = int(dut.uio_out.value) >> 4 & 3
+    assert first == 0, f"scan after reset, no edge yet in mode 2: {first}"
+    await FallingEdge(dut.clk)
+    assert scan_index(dut) == 1

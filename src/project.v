@@ -197,9 +197,11 @@ module tt_um_cyberhuman_7segment (
   // EN is the count enable, it comes from input pin 0
   wire en = ui_in[0];
 
-  // SEL picks which digit is shown: 0 = lowest digit, 3 = highest digit.
-  // It comes from bidirectional pins uio[4] (SEL0) and uio[5] (SEL1), used as inputs.
-  wire [1:0] sel = uio_in[5:4];
+  // SEL picks which digit is shown in the count modes 0 and 1: 0 = lowest
+  // digit, 3 = highest digit. It comes from bidirectional pins uio[4] (SEL0)
+  // and uio[5] (SEL1), used as inputs there. In the modes 2 and 3 the chip
+  // picks the digit itself (see the scan counter below).
+  wire [1:0] sel_pin = uio_in[5:4];
 
   // SPI pins: uio[0] is CS (active low), uio[1] is MOSI, uio[3] is SCK.
   // uio[2] is kept for MISO, it is not driven.
@@ -309,6 +311,21 @@ module tt_um_cyberhuman_7segment (
     endcase
   endfunction
 
+  // The scan counter: in the modes 2 and 3 it steps 0, 1, 2, 3, 0 on every
+  // rising edge of clk (not of the counter clock), whatever EN is. In the
+  // modes 0 and 1 it holds. Reset clears it. The mode comes from the SCK side
+  // without a synchroniser, like the other settings.
+  reg [1:0] scan;
+  wire      scanning = count_mode[1];
+  always @(posedge clk or negedge rst_n) begin
+    if (!rst_n)        scan <= 2'd0;
+    else if (scanning) scan <= scan + 2'd1;
+  end
+
+  // The digit shown: the SEL pins in the modes 0 and 1, the scan counter in
+  // the modes 2 and 3
+  wire [1:0] sel = scanning ? scan : sel_pin;
+
   // The selector: SEL chooses which digit's {dot, seg} goes to the output pins.
   // It is plain logic after the flip-flops, so a switch change shows at once,
   // without a clock edge. The dot is the top bit, the segments are the lower
@@ -324,8 +341,16 @@ module tt_um_cyberhuman_7segment (
   end
 
   assign uo_out  = shown;
-  assign uio_out = 0;
-  assign uio_oe  = 0;
+
+  // The digit select goes out on the bidirectional pins. Mode 2: the scan
+  // number on uio[5:4]. Mode 3: one active-high line per digit on uio[7:4]
+  // (uio[4] is digit 0). In the modes 0 and 1 nothing is driven. uio[3:0]
+  // (SPI) are never outputs.
+  wire mode2 = count_mode == 2'd2;
+  wire mode3 = count_mode == 2'd3;
+  wire [3:0] one_hot = 4'b0001 << scan;
+  assign uio_out = mode3 ? {one_hot, 4'b0000} : mode2 ? {2'b00, scan, 4'b0000} : 8'h00;
+  assign uio_oe  = mode3 ? 8'hF0 : mode2 ? 8'h30 : 8'h00;
 
   // List all unused inputs to prevent warnings
   wire _unused = &{ena, uio_in[7:6], uio_in[2], ui_in[7:3], 1'b0};
