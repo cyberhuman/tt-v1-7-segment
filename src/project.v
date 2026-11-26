@@ -73,15 +73,16 @@ module digit (
 
 endmodule
 
-// The settings register: written over SPI (mode 0, MSB first), one frame is
-// 24 bits: 4 unused bits, the pad bits of digit 3, 2, 1 and 0, then the bases
-// of digit 3, 2, 1 and 0, 4 bits each, in this order (the base of digit 0 is
-// the last 4 bits sent). On the 24th rising SCK edge the pad bits and the
-// bases are taken. A frame cut short by CS going high changes nothing.
+// The settings: registers written over SPI (mode 0, MSB first). A write is 16
+// bits: an address byte, then a data byte. On the 16th rising SCK edge the
+// register at that address takes the data. Several writes can follow each
+// other while CS stays low. A write cut short by CS going high changes
+// nothing. Bit 7 of the address is reserved for reads: a write with it set
+// changes nothing, and so does an address without a register.
 // Everything here is clocked by SCK, not by clk.
 module settings (
     input  wire       sck,    // SPI clock
-    input  wire       cs_n,   // SPI chip select, low while a frame is sent
+    input  wire       cs_n,   // SPI chip select, low while a write is sent
     input  wire       mosi,   // SPI data in
     input  wire       rst_n,  // reset_n - low to reset
     output reg  [3:0] pad,    // pad bit of each digit: 1 blanks its leading 0
@@ -91,26 +92,39 @@ module settings (
     output reg  [3:0] base3   // count base of digit 3
 );
 
-  // The bits received so far in this frame, newest in bit 0
-  reg [22:0] shift;
+  // Register addresses (7 bits, the top bit of the address byte is the read bit)
+  localparam [6:0] ADDR_BASE10 = 7'h00;  // {base1, base0}
+  localparam [6:0] ADDR_BASE32 = 7'h01;  // {base3, base2}
+  localparam [6:0] ADDR_PAD    = 7'h02;  // {4 unused bits, pad[3:0]}
 
-  // How many bits of this frame have been received (0..23)
-  reg [4:0] bit_count;
+  // The bits received so far in this write, newest in bit 0
+  reg [14:0] shift;
 
-  // The frame is complete when the 24th bit arrives: 23 bits are already in
+  // How many bits of this write have been received (0..15)
+  reg [3:0] bit_count;
+
+  // The write is complete when the 16th bit arrives: 15 bits are already in
   // the shift register, and the bit on MOSI is the last one.
-  // The counter is held at 0 while CS is high, so a cut-short frame is dropped.
-  // After the 24th bit it wraps to 0, so a second frame can follow.
+  // The counter is held at 0 while CS is high, so a cut-short write is dropped.
+  // It is 4 bits wide, so after the 16th bit it wraps to 0 and the next
+  // write can follow.
   always @(posedge sck or posedge cs_n) begin
     if (cs_n) begin
-      bit_count <= 5'd0;
+      bit_count <= 4'd0;
     end else begin
-      bit_count <= bit_count == 5'd23 ? 5'd0 : bit_count + 5'd1;
-      shift     <= {shift[21:0], mosi};
+      bit_count <= bit_count + 4'd1;
+      shift     <= {shift[13:0], mosi};
     end
   end
 
-  // The pad bits and the four bases are taken together, digit 3 first
+  // The complete write: the address byte, then the data byte
+  wire [15:0] word = {shift, mosi};
+  wire        read_bit = word[15];
+  wire [6:0]  addr = word[14:8];
+  wire [7:0]  data = word[7:0];
+
+  // The register at the address takes the data. To add a register: a new
+  // address above, an output port and reset value here, and one case line.
   always @(posedge sck or negedge rst_n) begin
     if (!rst_n) begin
       pad   <= 4'd0;
@@ -118,8 +132,13 @@ module settings (
       base1 <= 4'd0;
       base2 <= 4'd0;
       base3 <= 4'd0;
-    end else if (!cs_n && bit_count == 5'd23) begin
-      {pad, base3, base2, base1, base0} <= {shift[18:0], mosi};
+    end else if (!cs_n && bit_count == 4'd15 && !read_bit) begin
+      case (addr)
+        ADDR_BASE10: {base1, base0} <= data;
+        ADDR_BASE32: {base3, base2} <= data;
+        ADDR_PAD:    pad <= data[3:0];
+        default: ;
+      endcase
     end
   end
 

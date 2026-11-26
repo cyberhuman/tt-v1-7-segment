@@ -28,12 +28,13 @@ it set, the digit shows nothing while it and every digit above it are 0, so
   and that digit and all the digits below it are F. With the highest digit
   selected it is the carry-out of the whole counter.
 - `uio[0]`, `uio[1]` and `uio[3]` are **CS** (active low), **MOSI** and
-  **SCK** of an SPI port (mode 0, MSB first). A frame is 24 bits: 4 unused
-  bits, the pad bits of digit 3, 2, 1 and 0, then the bases of digit 3, 2, 1
-  and 0, 4 bits each, in this order (0 means 16). On its 24th clock edge the
-  pad bits and all four bases are taken. A frame cut short by CS going high
-  changes nothing, and SCK edges while CS is high are ignored. There is no
-  MISO.
+  **SCK** of an SPI port (mode 0, MSB first) that writes registers. A write is
+  16 bits: an address byte, then a data byte. The register takes the data on
+  the 16th clock edge, and more writes can follow while CS stays low. A write
+  cut short by CS going high changes nothing, and so do SCK edges while CS is
+  high. Bit 7 of the address is reserved for reads, so a write with it set
+  changes nothing, and neither does an address without a register. There is
+  no MISO yet.
 - `rst_n` (active low) clears the counter, so all four digits are 0, sets all
   four bases to 16 and clears the pad bits, so no digit is blanked. A blanked
   digit has all segments off; CO is not affected.
@@ -42,6 +43,12 @@ it set, the digit shows nothing while it and every digit above it are 0, so
   edges, not at the moment of one.
 - The counts and the segment outputs are held in flip-flops, so all segments
   change together on the rising edge of `clk`.
+
+| Address | Register | Data bits |
+|---------|----------|-----------|
+| 0x00 | BASE10 | 7:4 base of digit 1, 3:0 base of digit 0 (0 means 16) |
+| 0x01 | BASE32 | 7:4 base of digit 3, 3:0 base of digit 2 (0 means 16) |
+| 0x02 | PAD | 7:4 unused, 3:0 pad bit of digit 3 down to digit 0 |
 
 | Pin | Name | Direction | Meaning |
 |-----|------|-----------|---------|
@@ -69,9 +76,9 @@ and `uio` pins are unused; `uio[2]` is kept for MISO and is not driven.
    decimal point).
 2. Set EN (`ui[0]`) to 1 and SEL (`ui[2:1]`) to 0, the lowest digit.
 3. Pull `rst_n` low for a moment, then release it. The display shows 0 and all
-   bases are 16. For a clock (10, 6, 10, 6), send one 24-bit SPI frame with the
-   value 0x006A6A on CS, MOSI and SCK, between clock edges. To blank leading
-   zeros of the three upper digits too, send 0x0E6A6A.
+   bases are 16. For a clock (10, 6, 10, 6), write 0x00 = 0x6A and 0x01 = 0x6A
+   over SPI (CS, MOSI and SCK), between clock edges. To blank leading zeros of
+   the three upper digits too, write 0x02 = 0x0E.
 4. Apply a slow clock to `clk` (about 1 Hz) or press a push button. The display
    counts 0, 1, ... 9, A, b, C, d, E, F and wraps to 0 (with base 10 it stops at 9).
 5. The decimal point (CO) lights while the display shows the last digit of its

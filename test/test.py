@@ -20,35 +20,51 @@ CS, MOSI, SCK = 0x01, 0x02, 0x08
 SPI_HALF = 100  # ns, half of one SCK period
 
 
-def frame(*bases, pad=0):
-    # The 24-bit frame for the given bases and pad bits (bit n is digit n).
-    # One base is used for all four digits, four bases are given for digits
-    # 0..3 (digit 3 goes first). The 4 top bits are unused and sent as 0.
-    if len(bases) == 1:
-        bases = bases * 4
-    assert len(bases) == 4
-    return ((pad & 0xF) << 16) | sum(
-        (b & 0xF) << (4 * d) for d, b in enumerate(bases))
+# Register addresses
+BASE10, BASE32, PAD = 0x00, 0x01, 0x02
 
 
-async def spi_write(dut, value, bits=24):
-    # Bit-bang one SPI frame, mode 0, MSB first, CS idle high. MOSI changes
-    # while SCK is low and is sampled on the rising edge. Fewer bits than 24
-    # make a cut-short frame (the first bits of the value are sent). The whole
-    # write takes 5 us, well inside half a clock cycle (5 us), so it fits
-    # between clock edges.
-    dut.uio_in.value = 0            # CS low, SCK low
-    await Timer(SPI_HALF, unit="ns")
+async def spi_clock_bits(dut, value, bits):
+    # Send the top `bits` bits of a 16-bit value, MSB first, mode 0. CS must
+    # already be low. MOSI changes while SCK is low and is sampled on the
+    # rising edge.
     for i in range(bits):
-        bit = (value >> (23 - i)) & 1
+        bit = (value >> (15 - i)) & 1
         dut.uio_in.value = bit * MOSI
         await Timer(SPI_HALF, unit="ns")
         dut.uio_in.value = bit * MOSI | SCK
         await Timer(SPI_HALF, unit="ns")
         dut.uio_in.value = bit * MOSI
+
+
+async def spi_writes(dut, *writes, bits=16):
+    # Several (address, value) writes in one CS-low period, CS idle high.
+    # `bits` below 16 cuts the last write short (its first bits are sent).
+    # One write takes 3.2 us, so a few fit between clock edges (5 us).
+    dut.uio_in.value = 0            # CS low, SCK low
+    await Timer(SPI_HALF, unit="ns")
+    for n, (address, value) in enumerate(writes):
+        last = n == len(writes) - 1
+        await spi_clock_bits(dut, address << 8 | value, bits if last else 16)
     await Timer(SPI_HALF, unit="ns")
     dut.uio_in.value = CS           # CS back high
     await Timer(SPI_HALF, unit="ns")
+
+
+async def spi_write(dut, address, value, bits=16):
+    # One 16-bit write with its own CS pulse: address byte, then data byte
+    await spi_writes(dut, (address, value), bits=bits)
+
+
+async def write_settings(dut, base=0, pad=0):
+    # Write the bases and the pad bits. base is one number for all digits, or
+    # a list of four (digit 0 first); pad is the 4 pad bits (bit n is digit n).
+    bases = list(base) if isinstance(base, (list, tuple)) else [base] * 4
+    assert len(bases) == 4
+    await spi_writes(dut,
+                     (BASE10, (bases[1] & 0xF) << 4 | bases[0] & 0xF),
+                     (BASE32, (bases[3] & 0xF) << 4 | bases[2] & 0xF),
+                     (PAD, pad & 0xF))
 
 
 async def start(dut, en, sel=0, base=None, pad=0):
@@ -64,13 +80,11 @@ async def start(dut, en, sel=0, base=None, pad=0):
     dut.rst_n.value = 1
     # Look at the outputs on the falling edge, away from the rising edge
     await FallingEdge(dut.clk)
-    # Reset clears the bases, so they are written after reset. EN is held at 0
-    # during the write and one clock cycle, so the count stays at 0.
+    # Reset clears the registers, so they are written after reset. EN is held
+    # at 0 during the write and one clock cycle, so the count stays at 0.
     if base is not None or pad:
-        base = 0 if base is None else base
-        bases = base if isinstance(base, (list, tuple)) else [base]
         dut.ui_in.value = ui(0, sel)
-        await spi_write(dut, frame(*bases, pad=pad))
+        await write_settings(dut, 0 if base is None else base, pad)
         await FallingEdge(dut.clk)
         dut.ui_in.value = ui(en, sel)
 
@@ -263,82 +277,129 @@ async def test_base_default_16(dut):
     assert await read_base(dut) == 15
 
 
+async def read_settings(dut, clocks=400):
+    # Read the settings back through the display: count with EN = 1 for more
+    # than one full cycle and look at all four digits each clock. The base of
+    # a digit is the highest value it reaches + 1; its pad bit is set if it
+    # is ever blank. Only meaningful when every base is 2..4 (so the whole
+    # cycle is short). Returns (bases of digit 0..3, pad).
+    highest = [0] * 4
+    pad = 0
+    for _ in range(clocks):
+        for d, v in enumerate(await read_digits(dut)):
+            if v == 0:
+                pad |= 1 << d
+            else:
+                highest[d] = max(highest[d], PATTERNS.index(v))
+        dut.ui_in.value = ui(1, 0)
+        await FallingEdge(dut.clk)
+    return [h + 1 for h in highest], pad
+
+
+# Settings every register test starts from: all bases 2 and pad 0b0101. The
+# tests only raise bases, so the running count never ends up above a base.
+PRESET = ([2, 2, 2, 2], 0b0101)
+
+
+async def start_preset(dut):
+    await start(dut, 0, base=PRESET[0], pad=PRESET[1])
+    assert await read_settings(dut) == PRESET
+
+
 @cocotb.test()
-async def test_spi_short_frame_ignored(dut):
-    await start(dut, 1, base=10)
-    await spi_write(dut, frame(3), bits=23)   # cut short
-    await spi_write(dut, frame(0), bits=3)
-    assert await read_base(dut) == 9
+async def test_write_base10_alone(dut):
+    await start_preset(dut)
+    await spi_write(dut, BASE10, 0x43)       # base1 = 4, base0 = 3
+    assert await read_settings(dut) == ([3, 4, 2, 2], 0b0101)
+
+
+@cocotb.test()
+async def test_write_base32_alone(dut):
+    await start_preset(dut)
+    await spi_write(dut, BASE32, 0x43)       # base3 = 4, base2 = 3
+    assert await read_settings(dut) == ([2, 2, 3, 4], 0b0101)
+
+
+@cocotb.test()
+async def test_write_pad_alone(dut):
+    await start_preset(dut)
+    await spi_write(dut, PAD, 0xFA)          # upper 4 bits unused, pad = 1010
+    assert await read_settings(dut) == ([2, 2, 2, 2], 0b1010)
+
+
+@cocotb.test()
+async def test_nibble_order(dut):
+    # In BASE10 and BASE32 the higher digit is in the upper nibble
+    await start(dut, 0, base=1)
+    await spi_write(dut, BASE10, 0x42)       # base1 = 4, base0 = 2
+    await spi_write(dut, BASE32, 0x32)       # base3 = 3, base2 = 2
+    assert await read_settings(dut) == ([2, 4, 2, 3], 0)
+
+
+@cocotb.test()
+async def test_two_writes_one_cs_low(dut):
+    await start_preset(dut)
+    await spi_writes(dut, (BASE10, 0x33), (PAD, 0x03))
+    assert await read_settings(dut) == ([3, 3, 2, 2], 0b0011)
+    # Three in a row, the last one to the same register wins
+    await spi_writes(dut, (BASE32, 0x43), (BASE10, 0x33), (BASE10, 0x44))
+    assert await read_settings(dut) == ([4, 4, 3, 4], 0b0011)
+
+
+@cocotb.test()
+async def test_cut_short_write_ignored(dut):
+    await start_preset(dut)
+    for bits in (8, 15):
+        # An address and data that would change everything, cut short
+        await spi_write(dut, BASE10, 0x43, bits=bits)
+        await spi_write(dut, PAD, 0x0F, bits=bits)
+        assert await read_settings(dut) == PRESET, f"{bits} bits"
+    # A cut-short write does not leave bits behind: a full write still works
+    await spi_write(dut, BASE10, 0x43)
+    assert await read_settings(dut) == ([3, 4, 2, 2], 0b0101)
+
+
+@cocotb.test()
+async def test_cut_short_then_full_same_cs(dut):
+    await start_preset(dut)
+    # 8 bits, CS high, then a full write: the 8 bits are not carried over
+    await spi_write(dut, BASE32, 0x33, bits=8)
+    await spi_write(dut, PAD, 0x0A)
+    assert await read_settings(dut) == ([2, 2, 2, 2], 0b1010)
+
+
+@cocotb.test()
+async def test_read_bit_set_ignored(dut):
+    await start_preset(dut)
+    for address in (0x80 | BASE10, 0x80 | BASE32, 0x80 | PAD, 0xFF):
+        await spi_write(dut, address, 0x33)
+    assert await read_settings(dut) == PRESET
+
+
+@cocotb.test()
+async def test_unused_address_ignored(dut):
+    await start_preset(dut)
+    for address in (0x03, 0x04, 0x10, 0x7F):
+        await spi_write(dut, address, 0x33)
+    assert await read_settings(dut) == PRESET
+    # The address is decoded in full: a register address with a high bit set
+    for address in (0x40 | BASE10, 0x20 | PAD, 0x10 | BASE32):
+        await spi_write(dut, address, 0x33)
+    assert await read_settings(dut) == PRESET
 
 
 @cocotb.test()
 async def test_spi_cs_high_ignored(dut):
-    await start(dut, 1, base=10)
-    # SCK edges with CS high: 24 clocks carrying 1s, nothing happens
-    for _ in range(24):
-        dut.uio_in.value = CS | MOSI | SCK
-        await Timer(SPI_HALF, unit="ns")
-        dut.uio_in.value = CS | MOSI
-        await Timer(SPI_HALF, unit="ns")
-    assert await read_base(dut) == 9
-
-
-@cocotb.test()
-async def test_spi_two_frames_second_wins(dut):
-    await start(dut, 1)
-    # Two frames in one CS-low period: 48 SCK edges, the second frame wins
-    dut.uio_in.value = 0
-    await Timer(SPI_HALF, unit="ns")
-    for value in (frame(0xA), frame(3)):
-        for i in range(24):
-            bit = (value >> (23 - i)) & 1
-            dut.uio_in.value = bit * MOSI
+    await start_preset(dut)
+    # SCK edges with CS high: two full writes worth of clocks, valid writes
+    for value in (BASE10 << 8 | 0x43, PAD << 8 | 0x0F):
+        for i in range(16):
+            bit = (value >> (15 - i)) & 1
+            dut.uio_in.value = CS | bit * MOSI | SCK
             await Timer(SPI_HALF, unit="ns")
-            dut.uio_in.value = bit * MOSI | SCK
+            dut.uio_in.value = CS | bit * MOSI
             await Timer(SPI_HALF, unit="ns")
-            dut.uio_in.value = bit * MOSI
-    dut.uio_in.value = CS
-    await Timer(SPI_HALF, unit="ns")
-    assert await read_base(dut) == 2
-
-
-@cocotb.test()
-async def test_spi_half_frame_ignored(dut):
-    await start(dut, 1, base=[10, 6, 4, 3])
-    # 8 bits of a frame, CS high, then a full frame: only the full one counts
-    await spi_write(dut, frame(2), bits=8)
-    n = 0
-    for _ in range(61):
-        values = await read_digits(dut)
-        expected = [n % 10, n // 10 % 6, n // 60 % 4, n // 240 % 3]
-        assert values == [PATTERNS[e] for e in expected], f"count {n}"
-        dut.ui_in.value = ui(1, 0)
-        await FallingEdge(dut.clk)
-        n += 1
-
-
-@cocotb.test()
-async def test_frame_order(dut):
-    # The frame 0x5432 is digit 3 = 5, digit 2 = 4, digit 1 = 3, digit 0 = 2.
-    # Each digit shows its base - 1 just before it wraps: check via the carry.
-    cocotb.start_soon(Clock(dut.clk, 10, unit="us").start())
-    dut.ena.value = 1
-    dut.ui_in.value = ui(0, 0)
-    dut.uio_in.value = CS
-    dut.rst_n.value = 0
-    await ClockCycles(dut.clk, 5)
-    dut.rst_n.value = 1
-    await FallingEdge(dut.clk)
-    await spi_write(dut, 0x5432)
-    await FallingEdge(dut.clk)
-    n = 0
-    for _ in range(2 * 3 * 4 * 5 + 3):
-        values = await read_digits(dut, en=1)
-        expected = [n % 2, n // 2 % 3, n // 6 % 4, n // 24 % 5]
-        assert values == [PATTERNS[e] for e in expected], f"count {n}"
-        dut.ui_in.value = ui(1, 0)
-        await FallingEdge(dut.clk)
-        n += 1
+    assert await read_settings(dut) == PRESET
 
 
 @cocotb.test()
@@ -353,17 +414,6 @@ async def test_clock_10_6_10_6(dut):
         dut.ui_in.value = ui(1, 0)
         await FallingEdge(dut.clk)
     # Seconds just rolled: 59 -> 1:00 was passed at n = 59 -> 60 above
-
-
-@cocotb.test()
-async def test_reset_returns_base_16(dut):
-    await start(dut, 1, base=10)
-    assert await read_base(dut) == 9
-    dut.rst_n.value = 0
-    await ClockCycles(dut.clk, 3)
-    dut.rst_n.value = 1
-    await FallingEdge(dut.clk)
-    assert await read_base(dut) == 15
 
 
 async def step(dut, n=1):
@@ -440,20 +490,17 @@ async def test_pad_co_unchanged(dut):
 
 
 @cocotb.test()
-async def test_spi_16_bit_frame_ignored(dut):
-    await start(dut, 1, base=10, pad=0b1110)
-    # A 16-bit frame is cut short now: the pad bits and bases stay
-    await spi_write(dut, frame(3), bits=16)
-    assert await read_digits(dut) == [PATTERNS[0], 0, 0, 0]
-    assert await read_base(dut) == 9
-
-
-@cocotb.test()
-async def test_reset_clears_pad(dut):
-    await start(dut, 1, base=10, pad=0b1111)
+async def test_reset_clears_registers(dut):
+    await start(dut, 1, base=[2, 3, 4, 2], pad=0b1111)
     assert await read_digits(dut) == [0, 0, 0, 0]
     dut.rst_n.value = 0
     await ClockCycles(dut.clk, 3)
     dut.rst_n.value = 1
     await FallingEdge(dut.clk)
+    # Pad bits cleared: nothing is blank
     assert await read_digits(dut) == [PATTERNS[0]] * 4
+    # All bases are 16: after 16**3 clocks the count is 1000, not earlier
+    await step(dut, 0x1000 - 1)
+    assert await read_digits(dut) == [PATTERNS[15]] * 3 + [PATTERNS[0]]
+    await step(dut)
+    assert await read_digits(dut) == [PATTERNS[0]] * 3 + [PATTERNS[1]]
