@@ -19,7 +19,14 @@ else
 # Gate level simulation:
 SIM_BUILD				= sim_build/gl
 COMPILE_ARGS    += -DGL_TEST
+ifeq ($(SDF),)
 COMPILE_ARGS    += -DFUNCTIONAL
+else
+# Gate level with the delays of the hardened build: SDF is the path of a .sdf
+# file (runs/<run>/final/sdf/<corner>/*.sdf). The cell models keep their
+# specify blocks and the testbench annotates the SDF delays on top of them.
+COMPILE_ARGS    += -gspecify -DSDF_FILE=\"$(SIM_BUILD)/delays.sdf\"
+endif
 COMPILE_ARGS    += -DUSE_POWER_PINS
 COMPILE_ARGS    += -DSIM
 COMPILE_ARGS    += -DUNIT_DELAY=\#1
@@ -27,7 +34,13 @@ VERILOG_SOURCES += $(PDK_ROOT)/gf180mcuD/libs.ref/gf180mcu_fd_sc_mcu7t5v0/verilo
 VERILOG_SOURCES += $(PDK_ROOT)/gf180mcuD/libs.ref/gf180mcu_fd_sc_mcu7t5v0/verilog/gf180mcu_fd_sc_mcu7t5v0.v
 
 # this gets copied in by the GDS action workflow
+ifeq ($(SDF),)
 VERILOG_SOURCES += $(PWD)/gate_level_netlist.v
+else
+# the netlist and the SDF with names Icarus can match, see sdf_prepare.py
+$(shell mkdir -p $(SIM_BUILD) && python3 $(PWD)/sdf_prepare.py $(PWD)/gate_level_netlist.v $(SDF) $(SIM_BUILD)/netlist.v $(SIM_BUILD)/delays.sdf)
+VERILOG_SOURCES += $(SIM_BUILD)/netlist.v
+endif
 
 endif
 

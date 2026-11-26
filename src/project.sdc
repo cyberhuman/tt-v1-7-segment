@@ -26,6 +26,13 @@ create_clock $dec_port -name dec -period 200
 
 set_clock_groups -asynchronous -group [get_clocks $clock_port] -group [get_clocks sck] -group [get_clocks inc] -group [get_clocks dec]
 
+# DEC is also data: it picks the next count (the mux in front of each counter flip-flop).
+# That path starts at the press (rising edge of dec) and must be there before the same
+# edge arrives at the counter clock pin through the delay line, so the check is against
+# the same edge (setup multicycle 0), with 2 ns of margin on top of the usual 0.25 ns.
+set_multicycle_path 0 -setup -rise_from [get_ports {ui_in[2]}] -to [get_clocks dec]
+set_clock_uncertainty -setup 2.25 -from [get_clocks dec] -to [get_clocks dec]
+
 set input_delay_value [expr $::env(CLOCK_PERIOD) * $::env(IO_DELAY_CONSTRAINT) / 100]
 set output_delay_value [expr $::env(CLOCK_PERIOD) * $::env(IO_DELAY_CONSTRAINT) / 100]
 puts "\[INFO] Setting output delay to: $output_delay_value"
@@ -65,15 +72,15 @@ set_output_delay $output_delay_value -clock $clocks [all_outputs]
 set sck_delay_value [expr 100 * $::env(IO_DELAY_CONSTRAINT) / 100]
 set_input_delay $sck_delay_value -clock [get_clocks sck] [get_ports {uio_in[0] uio_in[1]}]
 
-# The counter is clocked when INC or DEC falls, so the delays against inc and dec
-# are referenced to the falling edge (-clock_fall).
+# The counter is clocked when INC or DEC rises (the press), through a delay line,
+# so the delays against inc and dec are referenced to the rising edge.
 # EN also gates the counter when INC clocks it, so it is timed against inc too,
 # and so are the outputs, which are launched by the counter flip-flops
 set inc_delay_value [expr 100 * $::env(IO_DELAY_CONSTRAINT) / 100]
-set_input_delay $inc_delay_value -clock_fall -clock [get_clocks inc] -add_delay [get_ports {ui_in[0]}]
-set_output_delay $inc_delay_value -clock_fall -clock [get_clocks inc] -add_delay [all_outputs]
-set_input_delay $inc_delay_value -clock_fall -clock [get_clocks dec] -add_delay [get_ports {ui_in[0]}]
-set_output_delay $inc_delay_value -clock_fall -clock [get_clocks dec] -add_delay [all_outputs]
+set_input_delay $inc_delay_value -clock [get_clocks inc] -add_delay [get_ports {ui_in[0]}]
+set_output_delay $inc_delay_value -clock [get_clocks inc] -add_delay [all_outputs]
+set_input_delay $inc_delay_value -clock [get_clocks dec] -add_delay [get_ports {ui_in[0]}]
+set_output_delay $inc_delay_value -clock [get_clocks dec] -add_delay [all_outputs]
 
 if { ![info exists ::env(SYNTH_CLK_DRIVING_CELL)] } {
     set ::env(SYNTH_CLK_DRIVING_CELL) $::env(SYNTH_DRIVING_CELL)

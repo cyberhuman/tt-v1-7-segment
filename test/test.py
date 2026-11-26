@@ -1,9 +1,17 @@
 # SPDX-FileCopyrightText: © 2026 Raman Varabets
 # SPDX-License-Identifier: Apache-2.0
 
+import os
+
 import cocotb
 from cocotb.clock import Clock
 from cocotb.triggers import ClockCycles, FallingEdge, RisingEdge, Timer
+
+# The gate level run of the repo (make GATES=yes) has no gate delays. The tests
+# that press DEC rely on the DEC pin choosing the count before the delayed
+# clock edge arrives, which that run cannot show. They are skipped there. They
+# run in RTL, and with the delays of the build (make GATES=yes SDF=<file>).
+GL_NO_DELAY = os.environ.get("GATES") == "yes" and not os.environ.get("SDF")
 
 # Segment patterns {g,f,e,d,c,b,a} for the digits 0..F
 MINUS = 0x40  # segment G only
@@ -1185,22 +1193,29 @@ async def test_ui_in_2_1_select_nothing(dut):
 
 
 # INC, DEC and the count mode (CTRL bits 1:0). In the modes 1 to 3 a step
-# comes when INC or DEC is released: INC counts up, DEC counts down.
+# comes when INC or DEC is pressed: INC counts up, DEC counts down.
+
+# Time given to the gates after a stimulus before the outputs are looked at.
+# The slowest press-to-output path is about 100 ns at the slowest corner (the
+# 4 delay cells, the counter, the output), and the half clock period is 5 us.
+# RTL has no delay, so it only makes the tests wait.
+SETTLE = 500  # ns
+
 
 async def set_mode(dut, mode, ctrl=0):
-    # Write CTRL = ctrl | mode while clk is high, with INC and DEC low: the
-    # counter clock is high before and after the switch, so it makes no edge.
-    # The write starts just after a rising edge and ends before the falling one.
+    # Write CTRL = ctrl | mode while clk is low, with INC and DEC low: the
+    # counter clock is low before and after the switch, so it makes no edge.
+    # The write starts just after a falling edge and ends before the rising
+    # one (3.3 us of the 5 us clk-low time); the caller carries on from there.
     drive(dut, 0, 0)
-    await RisingEdge(dut.clk)
+    await FallingEdge(dut.clk)
     await Timer(100, unit="ns")
     await spi_write(dut, CTRL, ctrl | mode)
-    await FallingEdge(dut.clk)
 
 
 async def press(dut, pins, en=1, hold=200):
     # One press of each pin of `pins` in turn ("I" for INC, "D" for DEC), each
-    # held for `hold` ns, with EN = en. A step comes when a pin is released.
+    # held for `hold` ns, with EN = en. A step comes when a pin is pressed.
     # clk keeps running.
     drive(dut, en, 0)
     await Timer(200, unit="ns")  # EN settles before the first edge
@@ -1220,48 +1235,98 @@ async def dec_pulses(dut, n=1, en=1):
 
 
 async def start_mode(dut, mode, ctrl=0, base=None):
-    # Reset, then the mode while clk is high
+    # Reset, then the mode while clk is low
     await start(dut, 0, base=base)
     await set_mode(dut, mode, ctrl)
 
 
+async def shown_now(dut):
+    # uo_out[6:0] of digit 0 as it is now (SEL 0), without waiting for anything
+    return int(dut.uo_out.value) & 0x7F
+
+
 @cocotb.test()
-async def test_inc_mode1_counts_on_release(dut):
+async def test_inc_mode1_counts_on_press(dut):
     await start_mode(dut, 1)
     await step(dut, 10)
     await check_digits(dut, [0, 0, 0, 0], "clk in mode 1")
     await inc_pulses(dut, 5)
     await check_digits(dut, [5, 0, 0, 0], "5 INC pulses")
-    # Nothing changes while INC is held high, the step comes on the falling edge
+    # The step is there right after the rising edge of INC
     drive(dut, 1, 0)
+    await Timer(SETTLE, unit="ns")
+    assert await shown_now(dut) == PATTERNS[5]
     set_inc(dut, 1)
+    await Timer(SETTLE, unit="ns")
+    assert await shown_now(dut) == PATTERNS[6], "step on the rising edge of INC"
+    # Nothing changes while INC is held high, nor when it is released
     await step(dut, 3)
     await Timer(1, unit="us")
-    assert await lit(dut, 0) == PATTERNS[5], "INC held high, clk running"
+    assert await shown_now(dut) == PATTERNS[6], "INC held high, clk running"
     set_inc(dut, 0)
-    assert await lit(dut, 0) == PATTERNS[6], "step on the falling edge of INC"
+    await Timer(1, unit="us")
+    assert await shown_now(dut) == PATTERNS[6], "no step on release of INC"
     await step(dut, 3)
     await check_digits(dut, [6, 0, 0, 0], "no more steps")
 
 
-@cocotb.test()
-async def test_dec_mode1_counts_down_on_release(dut):
+# Skipped in the gate level run without delays: presses DEC, and that race needs the gate delays.
+@cocotb.test(skip=GL_NO_DELAY)
+async def test_dec_mode1_counts_down_on_press(dut):
     await start_mode(dut, 1)
-    await dec_pulses(dut, 1)
-    await check_digits(dut, [15, 15, 15, 15], "0000 down to FFFF")
     drive(dut, 1, 0)
+    await Timer(SETTLE, unit="ns")
     set_dec(dut, 1)
+    await Timer(SETTLE, unit="ns")
+    assert await shown_now(dut) == PATTERNS[15], "0000 down to FFFF on the rising edge of DEC"
     await step(dut, 3)
-    assert await lit(dut, 0) == PATTERNS[15], "DEC held high"
+    assert await shown_now(dut) == PATTERNS[15], "DEC held high"
     set_dec(dut, 0)
-    assert await lit(dut, 0) == PATTERNS[14], "step on the falling edge of DEC"
+    await Timer(1, unit="us")
+    assert await shown_now(dut) == PATTERNS[15], "no step on release of DEC"
+    await check_digits(dut, [15, 15, 15, 15], "0000 down to FFFF")
     await dec_pulses(dut, 15)
+    await check_digits(dut, [0, 15, 15, 15], "down to FFF0")
+    await dec_pulses(dut, 1)
     await check_digits(dut, [15, 14, 15, 15], "borrow into digit 1")
-    await dec_pulses(dut, 16 * 16 - 15 + 1)
-    await check_digits(dut, [13, 15, 14, 15], "borrow into digits 1, 2")
 
 
-@cocotb.test()
+# Skipped in the gate level run without delays: presses DEC, and that race needs the gate delays.
+@cocotb.test(skip=GL_NO_DELAY)
+async def test_dec_borrow_on_press_base16(dut):
+    await start_mode(dut, 1)
+    await inc_pulses(dut, 16)
+    await check_digits(dut, [0, 1, 0, 0], "0010")
+    drive(dut, 1, 0)
+    await Timer(SETTLE, unit="ns")
+    set_dec(dut, 1)
+    await Timer(SETTLE, unit="ns")
+    # still pressed: the borrow is already there
+    assert [int(dut.uo_out.value) & 0x7F] == [PATTERNS[15]], "digit 0 after DEC press"
+    set_dec(dut, 0)
+    await check_digits(dut, [15, 0, 0, 0], "0010 down to 000F")
+
+
+# Skipped in the gate level run without delays: presses DEC, and that race needs the gate delays.
+@cocotb.test(skip=GL_NO_DELAY)
+async def test_dec_borrow_on_press_base10(dut):
+    await start_mode(dut, 1, base=[10, 6, 10, 6])
+    await inc_pulses(dut, 10)
+    await check_digits(dut, [0, 1, 0, 0], "10")
+    drive(dut, 1, 0)
+    await Timer(SETTLE, unit="ns")
+    set_dec(dut, 1)
+    await Timer(SETTLE, unit="ns")
+    assert await shown_now(dut) == PATTERNS[9], "digit 0 after DEC press"
+    drive(dut, 1, 1)
+    await Timer(1, unit="us")
+    assert int(dut.uo_out.value) & 0x7F == PATTERNS[0], "digit 1 after DEC press"
+    set_dec(dut, 0)
+    await check_digits(dut, [9, 0, 0, 0], "10 down to 09")
+
+
+# Skipped in the gate level run without delays: presses DEC, and that race needs the gate delays.
+@cocotb.test(skip=GL_NO_DELAY)
 async def test_dec_base10_borrow(dut):
     await start_mode(dut, 1, base=[10, 6, 10, 6])
     await dec_pulses(dut, 1)
@@ -1270,7 +1335,8 @@ async def test_dec_base10_borrow(dut):
     await check_digits(dut, [9, 4, 9, 5], "borrow")
 
 
-@cocotb.test()
+# Skipped in the gate level run without delays: presses DEC, and that race needs the gate delays.
+@cocotb.test(skip=GL_NO_DELAY)
 async def test_inc_inc_dec(dut):
     await start_mode(dut, 1)
     await inc_pulses(dut, 3)
@@ -1278,7 +1344,8 @@ async def test_inc_inc_dec(dut):
     await check_digits(dut, [4, 0, 0, 0], "one above the start")
 
 
-@cocotb.test()
+# Skipped in the gate level run without delays: presses DEC, and that race needs the gate delays.
+@cocotb.test(skip=GL_NO_DELAY)
 async def test_alternating_both_orders(dut):
     await start_mode(dut, 1)
     await inc_pulses(dut, 10)
@@ -1292,7 +1359,8 @@ async def test_alternating_both_orders(dut):
     await check_digits(dut, [8, 0, 0, 0], "I D D")
 
 
-@cocotb.test()
+# Skipped in the gate level run without delays: presses DEC, and that race needs the gate delays.
+@cocotb.test(skip=GL_NO_DELAY)
 async def test_first_pulse_after_reset(dut):
     await start_mode(dut, 1)
     await press(dut, "D")
@@ -1314,7 +1382,8 @@ async def test_first_inc_after_reset(dut):
     await check_digits(dut, [1, 0, 0, 0], "first pulse INC")
 
 
-@cocotb.test()
+# Skipped in the gate level run without delays: presses DEC, and that race needs the gate delays.
+@cocotb.test(skip=GL_NO_DELAY)
 async def test_ctrl_down_ignored_in_modes_1_3(dut):
     await start(dut, 0)
     for mode in (1, 2, 3):
@@ -1364,7 +1433,8 @@ async def test_inc_dec_ignored_in_mode0(dut):
     assert await lit(dut, 0) == PATTERNS[5], "still counts up"
 
 
-@cocotb.test()
+# Skipped in the gate level run without delays: presses DEC, and that race needs the gate delays.
+@cocotb.test(skip=GL_NO_DELAY)
 async def test_en_gates_inc_and_dec(dut):
     await start_mode(dut, 1)
     await press(dut, "IDI", en=0)
@@ -1384,7 +1454,8 @@ async def test_inc_carry_across_digits(dut):
     await check_digits(dut, [1, 1, 1, 0], "carry over three digits")
 
 
-@cocotb.test()
+# Skipped in the gate level run without delays: presses DEC after the INC presses, and that race needs the gate delays.
+@cocotb.test(skip=GL_NO_DELAY)
 async def test_inc_base10(dut):
     await start_mode(dut, 1, base=10)
     await inc_pulses(dut, 9)
@@ -1396,19 +1467,20 @@ async def test_inc_base10(dut):
 
 
 @cocotb.test()
-async def test_count_loads_on_release_of_inc(dut):
+async def test_count_loads_on_press_of_inc(dut):
     await start_mode(dut, 1)
     await inc_pulses(dut, 2)
     await spi_write(dut, COUNT10, 0x34)
     await spi_write(dut, COUNT32, 0x12)
-    # clk edges do not load, nor does a press held high
+    # clk edges do not load
     await step(dut, 3)
     await check_digits(dut, [2, 0, 0, 0], "written, not loaded by clk", en=0)
+    drive(dut, 0, 0)
     set_inc(dut, 1)
     await Timer(1, unit="us")
-    await check_digits(dut, [2, 0, 0, 0], "INC held high", en=0)
+    await check_digits(dut, [4, 3, 2, 1], "loaded on the press, the load edge does not count", en=0)
     set_inc(dut, 0)
-    await check_digits(dut, [4, 3, 2, 1], "loaded on release, load edge does not count")
+    await check_digits(dut, [4, 3, 2, 1], "nothing on release", en=0)
     await inc_pulses(dut, 1)
     await check_digits(dut, [5, 3, 2, 1], "counts after the load")
     # Writing the same value again loads again, with EN = 0 too
@@ -1417,18 +1489,44 @@ async def test_count_loads_on_release_of_inc(dut):
     await check_digits(dut, [4, 3, 2, 1], "same value again", en=0)
 
 
-@cocotb.test()
-async def test_count_loads_on_release_of_dec(dut):
+# Skipped in the gate level run without delays: presses DEC, and that race needs the gate delays.
+@cocotb.test(skip=GL_NO_DELAY)
+async def test_count_loads_on_press_of_dec(dut):
     await start_mode(dut, 1)
     await spi_write(dut, COUNT10, 0x34)
     await spi_write(dut, COUNT32, 0x12)
-    await dec_pulses(dut, 1)
-    await check_digits(dut, [4, 3, 2, 1], "loaded on DEC release, not counted down")
+    drive(dut, 1, 0)
+    await Timer(SETTLE, unit="ns")
+    set_dec(dut, 1)
+    await Timer(1, unit="us")
+    await check_digits(dut, [4, 3, 2, 1], "loaded on DEC press, not counted down")
+    set_dec(dut, 0)
+    await check_digits(dut, [4, 3, 2, 1], "nothing on release")
     await dec_pulses(dut, 1)
     await check_digits(dut, [3, 3, 2, 1], "counts down after the load")
 
 
-@cocotb.test()
+# Skipped in the gate level run without delays: presses DEC, and that race needs the gate delays.
+@cocotb.test(skip=GL_NO_DELAY)
+async def test_carry_shows_last_direction_pressed(dut):
+    # The carry-out on bit 7 follows the last input pressed: up it is high at
+    # F (for base 16), down it is high at 0
+    await start_mode(dut, 1)
+    await press(dut, "DD")
+    await check_digits(dut, [14, 15, 15, 15], "FFFE")
+    await press(dut, "I")
+    assert await dp(dut, 0) == 1, "up, at F: carry"
+    await press(dut, "D")
+    assert await dp(dut, 0) == 0, "down, at E: no borrow"
+    await dec_pulses(dut, 14)
+    await check_digits(dut, [0, 15, 15, 15], "FFF0")
+    assert await dp(dut, 0) == 1, "down, at 0: borrow"
+    await press(dut, "I")
+    assert await dp(dut, 0) == 0, "up, at 1: no carry"
+
+
+# Skipped in the gate level run without delays: presses DEC, and that race needs the gate delays.
+@cocotb.test(skip=GL_NO_DELAY)
 async def test_inc_modes_2_3(dut):
     for mode in (2, 3):
         await start_mode(dut, mode)
@@ -1447,15 +1545,16 @@ async def test_mode_switch_no_step(dut):
     await start(dut, 1)
     await step(dut, 3)
     assert await lit(dut, 0) == PATTERNS[3], "clk counts"
-    # 0 -> 1 with clk high, INC and DEC low: no step, and clk no longer counts.
-    # (With clk low the switch would give the counter clock a rising edge.)
+    # 0 -> 1 with clk low, INC and DEC low, EN = 1: no step, and clk no longer
+    # counts. (With clk high the switch back to mode 0 would give the counter
+    # clock a rising edge.)
     await set_mode(dut, 1)
     assert await lit(dut, 0) == PATTERNS[3]
     await step(dut, 3)
     await check_digits(dut, [3, 0, 0, 0], "mode 1, clk running")
     await inc_pulses(dut, 2)
     await check_digits(dut, [5, 0, 0, 0], "mode 1 counts INC")
-    # 1 -> 0 with clk high: no step, then clk counts, INC and DEC do not
+    # 1 -> 0 with clk low: no step, then clk counts, INC and DEC do not
     await set_mode(dut, 0)
     assert await lit(dut, 0) == PATTERNS[5]
     await step(dut, 1)
@@ -1466,17 +1565,32 @@ async def test_mode_switch_no_step(dut):
 
 
 @cocotb.test()
-async def test_mode_switch_clk_low_en_low_no_step(dut):
-    # With clk low a mode write gives the counter clock one edge (0 -> 1
-    # rises, 1 -> 0 falls); with EN = 0 that edge counts nothing
+async def test_mode_switch_clk_low_no_step_with_en(dut):
+    # EN = 1 the whole time: a mode write with clk low gives no step, either way
     await start(dut, 1)
     await step(dut, 3)
-    drive(dut, 0, 0)
     await spi_write(dut, CTRL, 1)  # at a falling edge of clk, clk low
-    await check_digits(dut, [3, 0, 0, 0], "0 -> 1, clk low, EN = 0", en=0)
+    drive(dut, 1, 0)
+    await Timer(1, unit="us")
+    assert await shown_now(dut) == PATTERNS[3], "0 -> 1, clk low, EN = 1"
     await FallingEdge(dut.clk)
     await spi_write(dut, CTRL, 0)
-    await check_digits(dut, [3, 0, 0, 0], "1 -> 0, clk low, EN = 0", en=0)
+    drive(dut, 1, 0)
+    await Timer(1, unit="us")
+    assert await shown_now(dut) == PATTERNS[3], "1 -> 0, clk low, EN = 1"
+
+
+@cocotb.test()
+async def test_mode_switch_clk_high_en_low_no_step(dut):
+    # With clk high a mode write from a pin mode to mode 0 gives the counter
+    # clock a rising edge; with EN = 0 that edge counts nothing
+    await start_mode(dut, 1)
+    await inc_pulses(dut, 3)
+    drive(dut, 0, 0)
+    await RisingEdge(dut.clk)
+    await Timer(100, unit="ns")
+    await spi_write(dut, CTRL, 0)  # clk high
+    await check_digits(dut, [3, 0, 0, 0], "1 -> 0, clk high, EN = 0", en=0)
 
 
 @cocotb.test()
@@ -1610,7 +1724,8 @@ async def test_scan_not_stopped_by_en(dut):
     assert sorted(set(outs)) == [0, 1, 2, 3]
 
 
-@cocotb.test()
+# Skipped in the gate level run without delays: presses DEC, and that race needs the gate delays.
+@cocotb.test(skip=GL_NO_DELAY)
 async def test_scan_with_inc_and_dec(dut):
     for mode in (2, 3):
         await start_mode(dut, mode)

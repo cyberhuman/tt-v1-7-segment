@@ -23,8 +23,8 @@ carry-out of the digit or its inverse. The display shows one digit at a time.
   EN = 1 the counter steps on each counter clock edge. With EN = 0 it holds
   its value. EN works in every count mode.
 - `ui[1]` is **INC** and `ui[2]` is **DEC**, the counting inputs in the count
-  modes 1 to 3. INC counts up and DEC counts down, each when it is released:
-  the step comes on the falling edge of the pin, not while it is held high.
+  modes 1 to 3. INC counts up and DEC counts down, each when it is pressed:
+  the step comes on the rising edge of the pin, nothing happens on release.
   `clk` does not count then. Use one at a time: pressing both together is not
   defined. INC and DEC pulses, and the gaps between them, should be at
   least 100 ns. In mode 0 INC and DEC are ignored.
@@ -80,18 +80,22 @@ not apply: INC counts up and DEC counts down.
 Count mode (CTRL bits 1:0): in mode 0 the counter is clocked by `clk`, as
 before, CTRL bit 2 gives the direction, and INC and DEC are ignored. In modes
 1, 2 and 3 INC (`ui[1]`) counts up and DEC (`ui[2]`) counts down, each when it
-is released, and `clk` does not count. Modes 2 and 3 also scan the display (below).
-The counter has one clock, and the direction must be settled before
-the counting edge, so the step comes on release: DEC sets a direction flip-flop
-when it is pressed, INC clears it, and the counter clock is high only while
-both are low. The count mode is not glitch-free: a write to it may make one
-edge on the counter clock, which can count or load once. So set the mode first,
-and then the count. A mode write while `clk` is low gives the counter one
-clock edge: change the mode while EN is low or `clk` is high, then write the
-count.
+is pressed, and `clk` does not count. Modes 2 and 3 also scan the display (below).
+Both next counts, up and down, are worked out all the time, and the DEC pin
+itself picks one in front of the flip-flops (INC leaves DEC low, so up waits).
+The counter clock is a delayed copy of INC or DEC, so the pick is made before
+the edge arrives. The gate-level tests do not model this delay, so the tests
+that press DEC are skipped there and run in RTL simulation; the timing is
+checked by static timing analysis, and by a gate-level run with the delays of
+the build. A direction flip-flop (set by DEC, cleared by INC) only tells
+the display which carry-out to show. The count mode is not glitch-free: a write
+to it may make one edge on the counter clock, which can count or load once. So
+set the mode first, and then the count. A mode write while `clk` is high gives
+the counter one clock edge: change the mode while `clk` is low or EN is low,
+then write the count.
 
 Setting the count: a write to COUNT10 or COUNT32 is taken on the next rising
-edge of the counter clock (`clk` in mode 0, the release of INC or DEC in the other modes), which loads those two digits instead of counting, whatever EN
+edge of the counter clock (`clk` in mode 0, the press of INC or DEC in the other modes), which loads those two digits instead of counting, whatever EN
 and the direction are. Writing the same value again loads again, and writing
 both registers before one edge loads all four digits on that edge. A digit that
 loads has no carry-out on that edge, and a value at or above the base is taken
@@ -124,8 +128,8 @@ inverse of CO. The reset value of DOT is 0xAA.
 | Pin | Name | Direction | Meaning |
 |-----|------|-----------|---------|
 | ui[0] | EN | in | count enable (carry-in) |
-| ui[1] | INC | in | counts up on release, count modes 1 to 3 |
-| ui[2] | DEC | in | counts down on release, count modes 1 to 3 |
+| ui[1] | INC | in | counts up on press, count modes 1 to 3 |
+| ui[2] | DEC | in | counts down on press, count modes 1 to 3 |
 | uio[0] | CS | in | SPI chip select, active low |
 | uio[1] | MOSI | in | SPI data in |
 | uio[3] | SCK | in | SPI clock |

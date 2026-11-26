@@ -5,21 +5,82 @@
 
 `default_nettype none
 
+// Simulation delays are in nanoseconds (the testbench uses the same scale)
+`timescale 1ns / 1ps
+
+// A 2:1 mux that is a real cell of the cell library, so synthesis cannot fold
+// it into the logic before it: it stays the last stage in front of a counter
+// flip-flop. Without the library (RTL simulation) it is the plain expression.
+// The mux2_2 cell is used because the library marks mux2_1 as not to be used.
+module count_mux (
+    input  wire i0,  // value when s = 0
+    input  wire i1,  // value when s = 1
+    input  wire s,   // select
+    output wire z
+);
+`ifdef SYNTHESIS
+  gf180mcu_fd_sc_mcu7t5v0__mux2_2 u (.I0(i0), .I1(i1), .S(s), .Z(z));
+`else
+  assign z = s ? i1 : i0;
+`endif
+endmodule
+
+// A delay line for the counter clock: a chain of delay cells of the library,
+// which the flow keeps as they are. In RTL simulation it is a plain delay.
+// It must hold the clock edge back until the DEC choice has reached the
+// flip-flops (see project.sdc for how the tools check this).
+module clock_delay (
+    input  wire i,
+    output wire z
+);
+`ifdef SYNTHESIS
+  wire [3:0] t;
+  gf180mcu_fd_sc_mcu7t5v0__dlyd_2 d0 (.I(i),    .Z(t[0]));
+  gf180mcu_fd_sc_mcu7t5v0__dlyd_2 d1 (.I(t[0]), .Z(t[1]));
+  gf180mcu_fd_sc_mcu7t5v0__dlyd_2 d2 (.I(t[1]), .Z(t[2]));
+  gf180mcu_fd_sc_mcu7t5v0__dlyd_2 d3 (.I(t[2]), .Z(t[3]));
+  assign z = t[3];
+`else
+  assign #10 z = i;
+`endif
+endmodule
+
+// A delay for EN on its way to the counter: delay cells of the library, kept as they are.
+// The counter clock arrives late in the pin modes, so EN must arrive later than it left the pin.
+module en_delay (
+    input  wire i,
+    output wire z
+);
+`ifdef SYNTHESIS
+  wire [1:0] t;
+  gf180mcu_fd_sc_mcu7t5v0__dlyd_2 d0 (.I(i),    .Z(t[0]));
+  gf180mcu_fd_sc_mcu7t5v0__dlyd_2 d1 (.I(t[0]), .Z(t[1]));
+  assign z = t[1];
+`else
+  assign z = i;
+`endif
+endmodule
+
 // One digit: a 4-bit counter and its 7 segment pattern. It works out the next
-// count for counting up and for counting down all the time; `down` only
+// count for counting up and for counting down all the time; `pick` only
 // chooses between the two finished values in front of the flip-flops.
 module digit (
     input  wire       clk,    // clock
     input  wire       rst_n,  // reset_n - low to reset
     input  wire       en_up,  // count enable counting up (carry-in of the up chain)
     input  wire       en_dn,  // count enable counting down (borrow-in of the down chain)
+    input  wire       en_up_s, // the same as en_up, for the carry shown on CO (not delayed, see en_delay)
+    input  wire       en_dn_s, // the same as en_dn, for the borrow shown on CO
     input  wire [3:0] base,   // count base (use 0 for 16)
-    input  wire       down,   // direction: 0 counts up, 1 counts down
+    input  wire       pick,   // direction that picks the next count: 0 up, 1 down
+    input  wire       down,   // direction that the carry-out shows: 0 up, 1 down
     input  wire       load,   // 1 loads `value` on the next clock edge instead of counting
     input  wire [3:0] value,  // the count to load
     output wire [6:0] seg,    // segments, bits are {g,f,e,d,c,b,a}
     output wire       co_up,  // carry-out of the up chain
     output wire       co_dn,  // borrow-out of the down chain
+    output wire       co_up_s, // carry-out of the shown up chain (from en_up_s)
+    output wire       co_dn_s, // borrow-out of the shown down chain (from en_dn_s)
     output wire       co,     // carry-out of the chain that `down` chooses
     output wire       zero    // the count is 0
 );
@@ -62,11 +123,19 @@ module digit (
   wire [3:0] count_up    = load ? value : !en_up ? count : next_up;
   wire [3:0] count_dn    = load ? value : !en_dn ? count : next_down;
 
-  // On each rising clock edge the counter takes its new value: the direction
-  // is the last choice in front of the flip-flops
+  // The direction is the last choice in front of the flip-flops: one mux cell
+  // per bit. `pick` may still be changing when the clock edge is on its way
+  // (a DEC press), so the clock is held back (see clock_delay).
+  wire [3:0] count_next;
+  count_mux mux0 (.i0(count_up[0]), .i1(count_dn[0]), .s(pick), .z(count_next[0]));
+  count_mux mux1 (.i0(count_up[1]), .i1(count_dn[1]), .s(pick), .z(count_next[1]));
+  count_mux mux2 (.i0(count_up[2]), .i1(count_dn[2]), .s(pick), .z(count_next[2]));
+  count_mux mux3 (.i0(count_up[3]), .i1(count_dn[3]), .s(pick), .z(count_next[3]));
+
+  // On each rising clock edge the counter takes its new value
   always @(posedge clk or negedge rst_n) begin
     if (!rst_n) count <= 4'd0;
-    else        count <= down ? count_dn : count_up;
+    else        count <= count_next;
   end
 
   // The segments are decoded from the count after the flip-flops (one decoder,
@@ -79,9 +148,14 @@ module digit (
   // count is 0, so the next digit steps down when this one wraps to base - 1.
   // A digit that is loading has no carry-out, so the next digit does not step
   // because of the old count.
-  assign co_up = !load & en_up & (count + 4'd1 == base);
+  // The same chains are built a second time from the undelayed EN for what CO and the
+  // dot show, so that the delay of EN (see en_delay) is not in the path from EN to the outputs.
+  wire   last  = (count + 4'd1 == base);
+  assign co_up = !load & en_up & last;
   assign co_dn = !load & en_dn & zero;
-  assign co    = down ? co_dn : co_up;
+  assign co_up_s = !load & en_up_s & last;
+  assign co_dn_s = !load & en_dn_s & zero;
+  assign co    = down ? co_dn_s : co_up_s;
 
   // The count is 0 (used by display mode 1 and by counting down)
   assign zero = count == 4'd0;
@@ -196,6 +270,8 @@ module tt_um_cyberhuman_7segment (
 
   // EN is the count enable, it comes from input pin 0
   wire en = ui_in[0];
+  wire en_cnt;  // EN as the counter sees it
+  en_delay en_pad (.i(en), .z(en_cnt));
 
   // SEL picks which digit is shown in the count modes 0 and 1: 0 = lowest
   // digit, 3 = highest digit. It comes from bidirectional pins uio[4] (SEL0)
@@ -223,19 +299,19 @@ module tt_um_cyberhuman_7segment (
                       .tgl10, .tgl32, .base0, .base1, .base2, .base3);
 
   // INC counts up and DEC counts down in the modes 1 to 3. They come from
-  // input pins 1 and 2. A step happens when the pressed input is released.
-  // Why: the counter has one clock, and the direction must be settled before
-  // the counting edge. So the direction is taken on the press, and the
-  // counter clock is high only while both inputs are low: its rising edge is
-  // the moment the pressed input is released.
+  // input pins 1 and 2. A step happens when the input is pressed.
+  // Why it works: the counter has one clock, a delayed copy of INC or DEC,
+  // so its rising edge is the press. The digits have both next counts ready;
+  // the DEC pin itself picks one in front of the flip-flops, and the clock
+  // edge arrives later than that choice (the delay line, checked by STA).
+  // While DEC is low the up count waits, so an INC press needs no switch.
   wire inc = ui_in[1];
   wire dec = ui_in[2];
 
   // The direction flip-flop: the rising edge of DEC sets it (D is constant 1),
   // INC high clears it (INC wins if both are high), and so does reset (an OR
-  // of the two on the one asynchronous clear). It is used in the modes 1 to 3
-  // only. Its paths to the counter are between unrelated clocks for STA (see
-  // project.sdc); they are separated by the pulse width, not by STA.
+  // of the two on the one asynchronous clear). It is for the display only:
+  // the carry-out shown in the modes 1 to 3 follows the last direction pressed.
   wire dec_clr = inc | ~rst_n;
   reg  dec_dir;
   always @(posedge dec or posedge dec_clr) begin
@@ -243,12 +319,20 @@ module tt_um_cyberhuman_7segment (
     else         dec_dir <= 1'b1;
   end
 
-  // The counter clock: clk in mode 0, in the other modes high while INC and
-  // DEC are both low. This is a plain switch, not glitch-free: a write to the
-  // mode makes an edge on it unless clk is high (and INC and DEC low).
-  wire count_clk = (count_mode == 2'd0) ? clk : ~(inc | dec);
+  // The counter clock: clk in mode 0, in the other modes a delayed copy of
+  // INC or DEC (low while both are low). This is a plain switch, not
+  // glitch-free: a write to the mode makes an edge on it if clk is high.
+  wire pin_clk;
+  clock_delay pin_delay (.i(inc | dec), .z(pin_clk));
+  wire count_clk = (count_mode == 2'd0) ? clk : pin_clk;
 
-  // The direction of the digits: CTRL bit 2 in mode 0, DEC in the other modes
+  // The direction that picks the next count: CTRL bit 2 in mode 0, the DEC pin
+  // itself in the other modes (a mux cell, so the choice is as short as it can be)
+  wire pick_down;
+  count_mux pick_mux (.i0(dec), .i1(down), .s(count_mode == 2'd0), .z(pick_down));
+
+  // The direction that the carry-out shows: CTRL bit 2 in mode 0, the last
+  // direction pressed in the other modes
   wire count_down = (count_mode == 2'd0) ? down : dec_dir;
 
   // Loading a count: each write to COUNT10 or COUNT32 flips a toggle bit on
@@ -274,6 +358,8 @@ module tt_um_cyberhuman_7segment (
   wire       co0, co1, co2, co3;
   wire       cu0, cu1, cu2, cu3;  // carry-out, up chain
   wire       cd0, cd1, cd2, cd3;  // borrow-out, down chain
+  wire       su0, su1, su2, su3;  // the same chains from the undelayed EN (shown on CO)
+  wire       sd0, sd1, sd2, sd3;
   wire       zero0, zero1, zero2, zero3;
 
   // Four digits in two chains, each with its own base (16 after reset, so
@@ -282,10 +368,10 @@ module tt_um_cyberhuman_7segment (
   // counts when the digit before it has a carry-out. The up chain (carry) and
   // the down chain (borrow) are both worked out all the time; each digit
   // picks its next count from them by the direction, as the last step.
-  digit digit0 (.clk(count_clk), .rst_n, .en_up(en),  .en_dn(en),  .base(base0), .down(count_down), .load(load10), .value(count10[3:0]), .seg(seg0), .co_up(cu0), .co_dn(cd0), .co(co0), .zero(zero0));
-  digit digit1 (.clk(count_clk), .rst_n, .en_up(cu0), .en_dn(cd0), .base(base1), .down(count_down), .load(load10), .value(count10[7:4]), .seg(seg1), .co_up(cu1), .co_dn(cd1), .co(co1), .zero(zero1));
-  digit digit2 (.clk(count_clk), .rst_n, .en_up(cu1), .en_dn(cd1), .base(base2), .down(count_down), .load(load32), .value(count32[3:0]), .seg(seg2), .co_up(cu2), .co_dn(cd2), .co(co2), .zero(zero2));
-  digit digit3 (.clk(count_clk), .rst_n, .en_up(cu2), .en_dn(cd2), .base(base3), .down(count_down), .load(load32), .value(count32[7:4]), .seg(seg3), .co_up(cu3), .co_dn(cd3), .co(co3), .zero(zero3));
+  digit digit0 (.clk(count_clk), .rst_n, .en_up(en_cnt),  .en_dn(en_cnt),  .en_up_s(en), .en_dn_s(en), .base(base0), .pick(pick_down), .down(count_down), .load(load10), .value(count10[3:0]), .seg(seg0), .co_up(cu0), .co_dn(cd0), .co_up_s(su0), .co_dn_s(sd0), .co(co0), .zero(zero0));
+  digit digit1 (.clk(count_clk), .rst_n, .en_up(cu0), .en_dn(cd0), .en_up_s(su0), .en_dn_s(sd0), .base(base1), .pick(pick_down), .down(count_down), .load(load10), .value(count10[7:4]), .seg(seg1), .co_up(cu1), .co_dn(cd1), .co_up_s(su1), .co_dn_s(sd1), .co(co1), .zero(zero1));
+  digit digit2 (.clk(count_clk), .rst_n, .en_up(cu1), .en_dn(cd1), .en_up_s(su1), .en_dn_s(sd1), .base(base2), .pick(pick_down), .down(count_down), .load(load32), .value(count32[3:0]), .seg(seg2), .co_up(cu2), .co_dn(cd2), .co_up_s(su2), .co_dn_s(sd2), .co(co2), .zero(zero2));
+  digit digit3 (.clk(count_clk), .rst_n, .en_up(cu2), .en_dn(cd2), .en_up_s(su2), .en_dn_s(sd2), .base(base3), .pick(pick_down), .down(count_down), .load(load32), .value(count32[7:4]), .seg(seg3), .co_up(cu3), .co_dn(cd3), .co_up_s(su3), .co_dn_s(sd3), .co(co3), .zero(zero3));
 
   // What each digit shows, by its 2-bit display mode (the segments only, CO
   // is not affected): 0 = the digit as is, 1 = the digit unless its own

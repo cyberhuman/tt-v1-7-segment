@@ -13,6 +13,11 @@ module tb ();
     #1;
   end
 
+`ifdef SDF_FILE
+  // Gate level with delays: annotate the SDF of the hardened build
+  initial $sdf_annotate(`SDF_FILE, user_project, , "sdf_annotate.log", "MAXIMUM");
+`endif
+
   // Wire up the inputs and outputs:
   reg clk;
   reg rst_n;
