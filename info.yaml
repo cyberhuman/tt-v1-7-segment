@@ -34,7 +34,7 @@ pinout:
   uo[4]: "E"
   uo[5]: "F"
   uo[6]: "G"
-  uo[7]: "CO"
+  uo[7]: "DP"
 
   # Bidirectional pins
   uio[0]: "CS"

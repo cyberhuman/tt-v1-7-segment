@@ -16,7 +16,8 @@ digit of its base to 0. Each digit has its own base, set over SPI: the default
 is 16 (hex) for all four. Bases 10, 6, 10, 6 (digit 0 first) make a clock that
 counts 00:00 to 59:59 and wraps to 00:00. Each digit also has a display mode:
 show it as is, show it unless it is 0 (so a 0 can be left blank), show
-nothing, or show a minus. The display shows one digit at a time.
+nothing, or show a minus. The decimal point of each digit can be off, on, the
+carry-out of the digit or its inverse. The display shows one digit at a time.
 
 - `ui[0]` is **EN**, the count enable (carry-in of the lowest digit). With
   EN = 1 the counter adds 1 on each clock cycle. With EN = 0 it holds its
@@ -24,9 +25,11 @@ nothing, or show a minus. The display shows one digit at a time.
 - `ui[1]` and `ui[2]` are **SEL0** and **SEL1**: they pick the digit shown,
   0 = lowest, 3 = highest. A change shows at once, without a clock edge.
 - `uo[0]` to `uo[6]` drive the segments A to G (active high) of the digit shown.
-- `uo[7]` is **CO**, the carry-out of the digit shown. It is high while EN = 1
-  and that digit and all the digits below it are F. With the highest digit
-  selected it is the carry-out of the whole counter.
+- `uo[7]` is **DP**, the decimal point of the digit shown. Its DOT value
+  (below) makes it off, on, the carry-out CO of that digit, or the inverse of
+  CO. CO is high while EN = 1 and that digit and all the digits below it are
+  F; with the highest digit selected it is the carry-out of the whole counter.
+  After reset it is CO.
 - `uio[0]`, `uio[1]` and `uio[3]` are **CS** (active low), **MOSI** and
   **SCK** of an SPI port (mode 0, MSB first) that writes registers. A write is
   16 bits: an address byte, then a data byte. The register takes the data on
@@ -36,8 +39,9 @@ nothing, or show a minus. The display shows one digit at a time.
   changes nothing, and neither does an address without a register. There is
   no MISO yet.
 - `rst_n` (active low) clears the counter, so all four digits are 0, sets all
-  four bases to 16 and all display modes to 0, so every digit is shown as is.
-  A mode changes the segments only; CO is not affected.
+  four bases to 16, all display modes to 0 (every digit is shown as is) and
+  all DOT values to 2 (the decimal point is CO). A mode changes the segments
+  only, and DOT changes bit 7 only; neither affects the counting.
 - The SPI side has its own clock, SCK, with no synchroniser to `clk`, so it
   works with a slow clock or a push button. Write the bases between clock
   edges, not at the moment of one.
@@ -49,9 +53,13 @@ nothing, or show a minus. The display shows one digit at a time.
 | 0x00 | BASE10 | 7:4 base of digit 1, 3:0 base of digit 0 (0 means 16) |
 | 0x01 | BASE32 | 7:4 base of digit 3, 3:0 base of digit 2 (0 means 16) |
 | 0x02 | MODE | 7:6 mode of digit 3, 5:4 digit 2, 3:2 digit 1, 1:0 digit 0 |
+| 0x03 | DOT | 7:6 dot of digit 3, 5:4 digit 2, 3:2 digit 1, 1:0 digit 0 |
 
 Display modes: 0 shows the digit, 1 shows it unless its own count is 0 (then
 all segments are off), 2 shows nothing, 3 shows a minus (segment G only).
+
+Dot values: 0 is off (bit 7 low), 1 is on (bit 7 high), 2 is CO, 3 is the
+inverse of CO. The reset value of DOT is 0xAA.
 
 | Pin | Name | Direction | Meaning |
 |-----|------|-----------|---------|
@@ -68,7 +76,7 @@ all segments are off), 2 shows nothing, 3 shows a minus (segment G only).
 | uo[4] | E | out | segment E |
 | uo[5] | F | out | segment F |
 | uo[6] | G | out | segment G |
-| uo[7] | CO | out | carry-out of the digit shown (decimal point) |
+| uo[7] | DP | out | decimal point of the digit shown (CO by default) |
 
 Clock and reset are the dedicated `clk` and `rst_n` pins. The other `ui` pins
 and `uio` pins are unused; `uio[2]` is kept for MISO and is not driven.
@@ -84,7 +92,7 @@ and `uio` pins are unused; `uio[2]` is kept for MISO and is not driven.
    the three upper digits, write 0x02 = 0x54.
 4. Apply a slow clock to `clk` (about 1 Hz) or press a push button. The display
    counts 0, 1, ... 9, A, b, C, d, E, F and wraps to 0 (with base 10 it stops at 9).
-5. The decimal point (CO) lights while the display shows the last digit of its
+5. The decimal point (CO by default) lights while the display shows the last digit of its
    base (F by default).
 6. Change SEL: the display shows the next digit, which steps once each time the
    lowest digit wraps (from F to 0, or from 9 to 0 with base 10).

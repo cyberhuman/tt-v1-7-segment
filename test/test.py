@@ -22,7 +22,11 @@ SPI_HALF = 100  # ns, half of one SCK period
 
 
 # Register addresses
-BASE10, BASE32, MODE = 0x00, 0x01, 0x02
+BASE10, BASE32, MODE, DOT = 0x00, 0x01, 0x02, 0x03
+
+# DOT values of one digit, and the register value after reset (CO everywhere)
+DOT_OFF, DOT_ON, DOT_CO, DOT_NCO = 0, 1, 2, 3
+DOT_RESET = 0xAA
 
 
 async def spi_clock_bits(dut, value, bits):
@@ -57,22 +61,24 @@ async def spi_write(dut, address, value, bits=16):
     await spi_writes(dut, (address, value), bits=bits)
 
 
-async def write_settings(dut, base=0, mode=0):
+async def write_settings(dut, base=0, mode=0, dot=DOT_RESET):
     # Write the bases and the modes. base is one number for all digits, or a
     # list of four (digit 0 first); mode is the MODE register value (2 bits
-    # per digit, digit 0 in bits 1:0).
+    # per digit, digit 0 in bits 1:0); dot is the DOT register value in the
+    # same layout, written only when it differs from the reset value.
     bases = list(base) if isinstance(base, (list, tuple)) else [base] * 4
     assert len(bases) == 4
     await spi_writes(dut,
                      (BASE10, (bases[1] & 0xF) << 4 | bases[0] & 0xF),
                      (BASE32, (bases[3] & 0xF) << 4 | bases[2] & 0xF),
-                     (MODE, mode & 0xFF))
+                     (MODE, mode & 0xFF),
+                     *([(DOT, dot & 0xFF)] if dot != DOT_RESET else []))
 
 
-async def start(dut, en, sel=0, base=None, mode=0):
+async def start(dut, en, sel=0, base=None, mode=0, dot=DOT_RESET):
     # Start the clock, hold reset for a few cycles, then release it.
     # base is one number for all digits, or a list of four (digit 0 first).
-    # mode is the MODE register value, written with the bases.
+    # mode and dot are the MODE and DOT register values, written with the bases.
     cocotb.start_soon(Clock(dut.clk, 10, unit="us").start())
     dut.ena.value = 1
     dut.ui_in.value = ui(en, sel)
@@ -84,9 +90,9 @@ async def start(dut, en, sel=0, base=None, mode=0):
     await FallingEdge(dut.clk)
     # Reset clears the registers, so they are written after reset. EN is held
     # at 0 during the write and one clock cycle, so the count stays at 0.
-    if base is not None or mode:
+    if base is not None or mode or dot != DOT_RESET:
         dut.ui_in.value = ui(0, sel)
-        await write_settings(dut, 0 if base is None else base, mode)
+        await write_settings(dut, 0 if base is None else base, mode, dot)
         await FallingEdge(dut.clk)
         dut.ui_in.value = ui(en, sel)
 
@@ -387,7 +393,7 @@ async def test_cut_short_then_full_same_cs(dut):
 @cocotb.test()
 async def test_read_bit_set_ignored(dut):
     await start_preset(dut)
-    for address in (0x80 | BASE10, 0x80 | BASE32, 0x80 | MODE, 0xFF):
+    for address in (0x80 | BASE10, 0x80 | BASE32, 0x80 | MODE, 0x80 | DOT, 0xFF):
         await spi_write(dut, address, 0x33)
     assert await read_settings(dut) == PRESET
 
@@ -395,7 +401,7 @@ async def test_read_bit_set_ignored(dut):
 @cocotb.test()
 async def test_unused_address_ignored(dut):
     await start_preset(dut)
-    for address in (0x03, 0x04, 0x10, 0x7F):
+    for address in (0x04, 0x05, 0x10, 0x7F):
         await spi_write(dut, address, 0x33)
     assert await read_settings(dut) == PRESET
     # The address is decoded in full: a register address with a high bit set
@@ -542,3 +548,118 @@ async def test_reset_clears_registers(dut):
     assert await read_digits(dut) == [PATTERNS[15]] * 3 + [PATTERNS[0]]
     await step(dut)
     assert await read_digits(dut) == [PATTERNS[0]] * 3 + [PATTERNS[1]]
+
+
+async def dp(dut, sel):
+    # uo_out[7] of one digit
+    dut.ui_in.value = ui(1, sel)
+    await Timer(1, unit="us")
+    return int(dut.uo_out.value) >> 7
+
+
+@cocotb.test()
+async def test_dot_reset_is_co(dut):
+    # After reset bit 7 is CO of each digit. Base 1 on digit 0 and 2 on
+    # digit 1 (written with DOT left alone) give CO on digit 0 at once.
+    await start(dut, 1, base=[1, 2, 2, 2])
+    assert [await dp(dut, d) for d in range(4)] == [1, 0, 0, 0]
+    await step(dut)
+    assert [await dp(dut, d) for d in range(4)] == [1, 1, 0, 0]
+    dut.ui_in.value = ui(0, 0)
+    await Timer(1, unit="us")
+    assert int(dut.uo_out.value) >> 7 == 0, "CO is low with EN = 0"
+
+
+@cocotb.test()
+async def test_dot_off_on(dut):
+    # Digit 0 counts 0..3: off keeps bit 7 low and on keeps it high, also at 3
+    for value, level in ((DOT_OFF, 0), (DOT_ON, 1)):
+        await start(dut, 1, base=4, dot=value * 0x55)
+        for i in range(10):
+            assert await dp(dut, 0) == level, f"dot {value} step {i}"
+            assert await lit(dut, 0) == PATTERNS[i % 4]
+            await step(dut)
+
+
+@cocotb.test()
+async def test_dot_inverse_co(dut):
+    await start(dut, 1, base=4, dot=0xFF)
+    for i in range(10):
+        assert await dp(dut, 0) == (0 if i % 4 == 3 else 1), f"step {i}"
+        await step(dut)
+    # With EN = 0 CO is low, so the inverse is high
+    dut.ui_in.value = ui(0, 0)
+    await Timer(1, unit="us")
+    assert int(dut.uo_out.value) >> 7 == 1
+
+
+async def dots(dut, en):
+    # uo_out[7] of all four digits (lowest first) with the given EN
+    values = []
+    for sel in range(4):
+        dut.ui_in.value = ui(en, sel)
+        await Timer(1, unit="us")
+        values.append(int(dut.uo_out.value) >> 7)
+    return values
+
+
+@cocotb.test()
+async def test_dot_differs_per_digit(dut):
+    # Bases 1 make CO of every digit equal to EN. With digit 0 off, digit 1
+    # on, digit 2 CO and digit 3 inverse CO, the pattern with EN = 1 and with
+    # EN = 0 tells every digit apart, so each bit pair is checked through SEL.
+    await start(dut, 1, base=1, dot=0b11_10_01_00)
+    assert await dots(dut, 1) == [0, 1, 1, 0]
+    assert await dots(dut, 0) == [0, 1, 0, 1]
+    # The other way round: digit 0 inverse CO, 1 CO, 2 on, 3 off
+    await start(dut, 1, base=1, dot=0b00_01_10_11)
+    assert await dots(dut, 1) == [0, 1, 1, 0]
+    assert await dots(dut, 0) == [1, 0, 1, 0]
+    # A pair of the other digits is not mixed in: only digit 2 changes
+    await start(dut, 1, base=1, dot=0b01_01_00_01)
+    assert await dots(dut, 1) == [1, 0, 1, 1]
+    assert await dots(dut, 0) == [1, 0, 1, 1]
+
+
+@cocotb.test()
+async def test_dot_off_keeps_carry(dut):
+    # Dot off on every digit: the carry between the digits still works
+    await start(dut, 1, base=[4, 3, 10, 10], dot=0)
+    for n in range(40):
+        values = await read_digits(dut)
+        expected = [n % 4, n // 4 % 3, n // 12 % 10, 0]
+        assert values == [PATTERNS[e] for e in expected], f"count {n}"
+        assert await dots(dut, 1) == [0] * 4, f"count {n}"
+        dut.ui_in.value = ui(1, 0)
+        await FallingEdge(dut.clk)
+
+
+@cocotb.test()
+async def test_dot_alone(dut):
+    await start_preset(dut)
+    # Reset value: bit 7 is CO, low with EN = 0. Inverse of CO is high.
+    assert await dots(dut, 0) == [0] * 4
+    await spi_write(dut, DOT, 0xFF)
+    assert await dots(dut, 0) == [1] * 4
+    assert await read_settings(dut) == PRESET
+    # The reverse: the other registers leave DOT alone
+    await spi_write(dut, DOT, 0xE4)          # off, on, CO, inverse
+    assert await dots(dut, 0) == [0, 1, 0, 1]
+    await spi_write(dut, BASE10, 0x43)
+    await spi_write(dut, BASE32, 0x43)
+    await spi_write(dut, MODE, 0x44)
+    assert await dots(dut, 0) == [0, 1, 0, 1]
+
+
+@cocotb.test()
+async def test_reset_returns_dot(dut):
+    await start(dut, 1, dot=0xFF)
+    assert await dots(dut, 0) == [1] * 4
+    dut.rst_n.value = 0
+    await ClockCycles(dut.clk, 3)
+    dut.rst_n.value = 1
+    await FallingEdge(dut.clk)
+    assert await dots(dut, 0) == [0] * 4, "CO is low with EN = 0"
+    # CO of digit 0 is high at F: the value is 0xAA, not 0x00
+    await step(dut, 15)
+    assert await dp(dut, 0) == 1

@@ -86,6 +86,7 @@ module settings (
     input  wire       mosi,   // SPI data in
     input  wire       rst_n,  // reset_n - low to reset
     output reg  [7:0] mode,   // display mode of each digit, 2 bits each, digit 0 in bits 1:0
+    output reg  [7:0] dot,    // what bit 7 shows for each digit, 2 bits each, digit 0 in bits 1:0
     output reg  [3:0] base0,  // count base of digit 0 (0 means 16)
     output reg  [3:0] base1,  // count base of digit 1
     output reg  [3:0] base2,  // count base of digit 2
@@ -96,6 +97,7 @@ module settings (
   localparam [6:0] ADDR_BASE10 = 7'h00;  // {base1, base0}
   localparam [6:0] ADDR_BASE32 = 7'h01;  // {base3, base2}
   localparam [6:0] ADDR_MODE   = 7'h02;  // {mode3, mode2, mode1, mode0}
+  localparam [6:0] ADDR_DOT    = 7'h03;  // {dot3, dot2, dot1, dot0}
 
   // The bits received so far in this write, newest in bit 0
   reg [14:0] shift;
@@ -128,6 +130,7 @@ module settings (
   always @(posedge sck or negedge rst_n) begin
     if (!rst_n) begin
       mode  <= 8'd0;
+      dot   <= 8'hAA;  // the carry-out of every digit
       base0 <= 4'd0;
       base1 <= 4'd0;
       base2 <= 4'd0;
@@ -137,6 +140,7 @@ module settings (
         ADDR_BASE10: {base1, base0} <= data;
         ADDR_BASE32: {base3, base2} <= data;
         ADDR_MODE:   mode <= data;
+        ADDR_DOT:    dot <= data;
         default: ;
       endcase
     end
@@ -167,11 +171,13 @@ module tt_um_cyberhuman_7segment (
   wire mosi = uio_in[1];
   wire sck  = uio_in[3];
 
-  // Display mode and counter base of each digit, set over SPI (after reset
-  // every digit is shown as is and all bases are 16)
+  // Display mode, decimal point and counter base of each digit, set over SPI
+  // (after reset every digit is shown as is, the decimal point is the
+  // carry-out and all bases are 16)
   wire [7:0] mode;
+  wire [7:0] dot;
   wire [3:0] base0, base1, base2, base3;
-  settings settings0 (.sck, .cs_n, .mosi, .rst_n, .mode, .base0, .base1, .base2, .base3);
+  settings settings0 (.sck, .cs_n, .mosi, .rst_n, .mode, .dot, .base0, .base1, .base2, .base3);
 
   // Segments and carry-out of each of the four digits
   wire [6:0] seg0, seg1, seg2, seg3;
@@ -199,16 +205,33 @@ module tt_um_cyberhuman_7segment (
     endcase
   endfunction
 
-  // The selector: SEL chooses which digit's {co, seg} goes to the output pins.
+  // What bit 7 (the decimal point) shows, by the 2-bit dot value of a digit:
+  // 0 = off, 1 = on, 2 = the carry-out of the digit, 3 = its inverse.
+  localparam [1:0] DOT_OFF = 2'd0;
+  localparam [1:0] DOT_ON  = 2'd1;
+  localparam [1:0] DOT_CO  = 2'd2;
+  localparam [1:0] DOT_NCO = 2'd3;
+
+  function apply_dot(input [1:0] d, input co);
+    case (d)
+      DOT_OFF: apply_dot = 1'b0;
+      DOT_ON:  apply_dot = 1'b1;
+      DOT_CO:  apply_dot = co;
+      DOT_NCO: apply_dot = ~co;
+    endcase
+  endfunction
+
+  // The selector: SEL chooses which digit's {dot, seg} goes to the output pins.
   // It is plain logic after the flip-flops, so a switch change shows at once,
-  // without a clock edge. CO is the top bit, the segments are the lower seven.
+  // without a clock edge. The dot is the top bit, the segments are the lower
+  // seven. The carry chain between the digits uses the real carry-out.
   reg [7:0] shown;
   always @(*) begin
     case (sel)
-      2'd0: shown = {co0, apply_mode(mode[1:0], seg0, zero0)};
-      2'd1: shown = {co1, apply_mode(mode[3:2], seg1, zero1)};
-      2'd2: shown = {co2, apply_mode(mode[5:4], seg2, zero2)};
-      2'd3: shown = {co3, apply_mode(mode[7:6], seg3, zero3)};
+      2'd0: shown = {apply_dot(dot[1:0], co0), apply_mode(mode[1:0], seg0, zero0)};
+      2'd1: shown = {apply_dot(dot[3:2], co1), apply_mode(mode[3:2], seg1, zero1)};
+      2'd2: shown = {apply_dot(dot[5:4], co2), apply_mode(mode[5:4], seg2, zero2)};
+      2'd3: shown = {apply_dot(dot[7:6], co3), apply_mode(mode[7:6], seg3, zero3)};
     endcase
   end
 
