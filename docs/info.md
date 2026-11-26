@@ -54,8 +54,8 @@ carry-out of the digit or its inverse. The display shows one digit at a time.
 - The SPI side has its own clock, SCK, with no synchroniser to `clk`, so it
   works with a slow clock or a push button. Write the bases between clock
   edges, not at the moment of one.
-- The counts and the segment outputs are held in flip-flops, so all segments
-  change together on the rising edge of the counter clock.
+- The counts are held in flip-flops and the segments are decoded from them, so
+  all segments change together after the rising edge of the counter clock.
 
 | Address | Register | Data bits |
 |---------|----------|-----------|

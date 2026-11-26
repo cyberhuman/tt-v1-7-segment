@@ -5,21 +5,26 @@
 
 `default_nettype none
 
-// One digit: a 4-bit counter and its 7 segment pattern
+// One digit: a 4-bit counter and its 7 segment pattern. It works out the next
+// count for counting up and for counting down all the time; `down` only
+// chooses between the two finished values in front of the flip-flops.
 module digit (
     input  wire       clk,    // clock
     input  wire       rst_n,  // reset_n - low to reset
-    input  wire       en,     // count enable (carry-in)
+    input  wire       en_up,  // count enable counting up (carry-in of the up chain)
+    input  wire       en_dn,  // count enable counting down (borrow-in of the down chain)
     input  wire [3:0] base,   // count base (use 0 for 16)
     input  wire       down,   // direction: 0 counts up, 1 counts down
     input  wire       load,   // 1 loads `value` on the next clock edge instead of counting
     input  wire [3:0] value,  // the count to load
-    output reg  [6:0] seg,    // segments, bits are {g,f,e,d,c,b,a}
-    output wire       co,     // carry-out
+    output wire [6:0] seg,    // segments, bits are {g,f,e,d,c,b,a}
+    output wire       co_up,  // carry-out of the up chain
+    output wire       co_dn,  // borrow-out of the down chain
+    output wire       co,     // carry-out of the chain that `down` chooses
     output wire       zero    // the count is 0
 );
 
-  // The 4-bit counter and the 7 segment outputs are both held in flip-flops
+  // The 4-bit counter is held in flip-flops, the segments are decoded from it
   reg [3:0] count;
 
   // The table of segment patterns: one hex digit in, its pattern out
@@ -45,43 +50,38 @@ module digit (
     endcase
   endfunction
 
-  // The pattern shown after reset: the digit 0, taken from the table
-  localparam [6:0] SEG_RESET = seg7(4'h0);
-
-  // What the counter will be after the next clock edge. With EN = 0 it holds.
-  // Counting up it is one more, and the base itself becomes 0. Counting down
-  // it is one less, and below 0 it wraps to base - 1 (F when the base is 16).
-  // A count above the base just counts down into range.
+  // What the counter will be after the next clock edge, worked out for both
+  // directions at once. With the enable at 0 it holds. Counting up it is one
+  // more, and the base itself becomes 0. Counting down it is one less, and
+  // below 0 it wraps to base - 1 (F when the base is 16). A count above the
+  // base just counts down into range. A load wins over counting, whatever the
+  // enable is. A loaded value at or above the base is taken as is.
   wire [3:0] next_up_raw = count + 4'd1;
   wire [3:0] next_up     = base == next_up_raw ? 4'd0 : next_up_raw;
   wire [3:0] next_down   = zero ? base - 4'd1 : count - 4'd1;
+  wire [3:0] count_up    = load ? value : !en_up ? count : next_up;
+  wire [3:0] count_dn    = load ? value : !en_dn ? count : next_down;
 
-  // A load wins over counting, whatever EN and the direction are. A loaded
-  // value at or above the base is taken as is.
-  wire [3:0] next_count = load ? value : !en ? count : down ? next_down : next_up;
-
-  // Segment pattern for that next digit (plain logic, no flip-flops)
-  wire [6:0] next_seg = seg7(next_count);
-
-  // On each rising clock edge the counter and the segments take their new
-  // values together, so the segment pins are driven straight from flip-flops
+  // On each rising clock edge the counter takes its new value: the direction
+  // is the last choice in front of the flip-flops
   always @(posedge clk or negedge rst_n) begin
-    if (!rst_n) begin
-      count <= 4'd0;
-      seg   <= SEG_RESET;
-    end else begin
-      count <= next_count;
-      seg   <= next_seg;
-    end
+    if (!rst_n) count <= 4'd0;
+    else        count <= down ? count_dn : count_up;
   end
 
-  // Carry out, high only when EN is 1. Counting up it is high on the last
-  // digit of the base (F for base 16), so the next digit steps when this one
-  // wraps to 0. Counting down it is the borrow: high when the count is 0,
-  // so the next digit steps down when this one wraps to base - 1.
+  // The segments are decoded from the count after the flip-flops (one decoder,
+  // no segment flip-flops). After reset the count is 0, so the digit 0 shows.
+  assign seg = seg7(count);
+
+  // Carry out of each chain, high only when its enable is 1. Counting up it is
+  // high on the last digit of the base (F for base 16), so the next digit steps
+  // when this one wraps to 0. Counting down it is the borrow: high when the
+  // count is 0, so the next digit steps down when this one wraps to base - 1.
   // A digit that is loading has no carry-out, so the next digit does not step
   // because of the old count.
-  assign co = !load & en & (down ? zero : count + 4'd1 == base);
+  assign co_up = !load & en_up & (count + 4'd1 == base);
+  assign co_dn = !load & en_dn & zero;
+  assign co    = down ? co_dn : co_up;
 
   // The count is 0 (used by display mode 1 and by counting down)
   assign zero = count == 4'd0;
@@ -272,16 +272,20 @@ module tt_um_cyberhuman_7segment (
   // Segments and carry-out of each of the four digits
   wire [6:0] seg0, seg1, seg2, seg3;
   wire       co0, co1, co2, co3;
+  wire       cu0, cu1, cu2, cu3;  // carry-out, up chain
+  wire       cd0, cd1, cd2, cd3;  // borrow-out, down chain
   wire       zero0, zero1, zero2, zero3;
 
-  // Four digits in a chain, each with its own base (16 after reset, so
+  // Four digits in two chains, each with its own base (16 after reset, so
   // together a 16-bit counter 0000..FFFF; bases 10, 6, 10, 6 make a clock
   // 00:00..59:59). The lowest digit counts when EN is 1, each next digit
-  // counts when the digit before it has a carry-out (counting down, a borrow).
-  digit digit0 (.clk(count_clk), .rst_n, .en,      .base(base0), .down(count_down), .load(load10), .value(count10[3:0]), .seg(seg0), .co(co0), .zero(zero0));
-  digit digit1 (.clk(count_clk), .rst_n, .en(co0), .base(base1), .down(count_down), .load(load10), .value(count10[7:4]), .seg(seg1), .co(co1), .zero(zero1));
-  digit digit2 (.clk(count_clk), .rst_n, .en(co1), .base(base2), .down(count_down), .load(load32), .value(count32[3:0]), .seg(seg2), .co(co2), .zero(zero2));
-  digit digit3 (.clk(count_clk), .rst_n, .en(co2), .base(base3), .down(count_down), .load(load32), .value(count32[7:4]), .seg(seg3), .co(co3), .zero(zero3));
+  // counts when the digit before it has a carry-out. The up chain (carry) and
+  // the down chain (borrow) are both worked out all the time; each digit
+  // picks its next count from them by the direction, as the last step.
+  digit digit0 (.clk(count_clk), .rst_n, .en_up(en),  .en_dn(en),  .base(base0), .down(count_down), .load(load10), .value(count10[3:0]), .seg(seg0), .co_up(cu0), .co_dn(cd0), .co(co0), .zero(zero0));
+  digit digit1 (.clk(count_clk), .rst_n, .en_up(cu0), .en_dn(cd0), .base(base1), .down(count_down), .load(load10), .value(count10[7:4]), .seg(seg1), .co_up(cu1), .co_dn(cd1), .co(co1), .zero(zero1));
+  digit digit2 (.clk(count_clk), .rst_n, .en_up(cu1), .en_dn(cd1), .base(base2), .down(count_down), .load(load32), .value(count32[3:0]), .seg(seg2), .co_up(cu2), .co_dn(cd2), .co(co2), .zero(zero2));
+  digit digit3 (.clk(count_clk), .rst_n, .en_up(cu2), .en_dn(cd2), .base(base3), .down(count_down), .load(load32), .value(count32[7:4]), .seg(seg3), .co_up(cu3), .co_dn(cd3), .co(co3), .zero(zero3));
 
   // What each digit shows, by its 2-bit display mode (the segments only, CO
   // is not affected): 0 = the digit as is, 1 = the digit unless its own
