@@ -29,9 +29,9 @@
 
   "//": "If you need a custom clock configuration, read the following documentation first:",
   "//": "https://tinytapeout.com/faq/#how-can-i-map-an-additional-external-clock-to-one-of-the-gpios",
-  "CLOCK_PORT": ["clk", "uio_in[3]", "ui_in[1]"],
+  "CLOCK_PORT": ["clk", "uio_in[3]", "ui_in[1]", "ui_in[2]"],
 
-  "//": "SDC for clk, for the SPI clock SCK on uio[3] and for the counter clock INC on ui[1] (all asynchronous)",
+  "//": "SDC for clk, for the SPI clock SCK on uio[3] and for the counter clocks INC on ui[1] and DEC on ui[2] (all asynchronous)",
   "PNR_SDC_FILE": "dir::project.sdc",
   "SIGNOFF_SDC_FILE": "dir::project.sdc",
 

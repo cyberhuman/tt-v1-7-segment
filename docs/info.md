@@ -20,11 +20,13 @@ nothing, or show a minus. The decimal point of each digit can be off, on, the
 carry-out of the digit or its inverse. The display shows one digit at a time.
 
 - `ui[0]` is **EN**, the count enable (carry-in of the lowest digit). With
-  EN = 1 the counter adds 1 on each counter clock edge. With EN = 0 it holds
+  EN = 1 the counter steps on each counter clock edge. With EN = 0 it holds
   its value. EN works in every count mode.
-- `ui[1]` is **INC**, the counter clock in the count modes 1 to 3. The counter
-  steps on each rising edge of INC, and `clk` does not count then. In mode 0
-  INC is ignored.
+- `ui[1]` is **INC** and `ui[2]` is **DEC**, the counting inputs in the count
+  modes 1 to 3. INC counts up and DEC counts down, each when it is released:
+  the step comes on the falling edge of the pin, not while it is held high.
+  `clk` does not count then. Use one at a time: pressing both together is not
+  defined. In mode 0 INC and DEC are ignored.
 - `uio[4]` and `uio[5]` are **SEL0** and **SEL1**: they pick the digit shown,
   0 = lowest, 3 = highest. A change shows at once, without a clock edge.
 - `uo[0]` to `uo[6]` drive the segments A to G (active high) of the digit shown.
@@ -64,21 +66,28 @@ carry-out of the digit or its inverse. The display shows one digit at a time.
 Display modes: 0 shows the digit, 1 shows it unless its own count is 0 (then
 all segments are off), 2 shows nothing, 3 shows a minus (segment G only).
 
-Counting down (CTRL bit 2 = 1): with EN = 1 each digit goes down by 1, and a
+Counting down in mode 0 (CTRL bit 2 = 1): with EN = 1 each digit goes down by 1, and a
 digit at 0 wraps to the last digit of its base (F for base 16). A digit steps
 when the digit before it wraps, so 0000 goes to FFFF, and with bases 10, 6, 10,
 6 the clock goes from 00:00 to 59:59. CO is then the borrow: high while EN = 1
-and that digit and all the digits below it are 0. After reset it counts up.
+and that digit and all the digits below it are 0. After reset it counts up. In the modes 1 to 3 the direction bit does
+not apply: INC counts up and DEC counts down.
 
 Count mode (CTRL bits 1:0): in mode 0 the counter is clocked by `clk`, as
-before, and INC is ignored. In modes 1, 2 and 3 it is clocked by INC (`ui[1]`)
-and `clk` does not count. For now modes 2 and 3 are the same as mode 1. The
-count mode is not glitch-free: a write to it may make one edge on the counter
-clock, which can count or load once. So set the mode first, with `clk` and INC
-low, and then the count.
+before, CTRL bit 2 gives the direction, and INC and DEC are ignored. In modes
+1, 2 and 3 INC (`ui[1]`) counts up and DEC (`ui[2]`) counts down, each when it
+is released, and `clk` does not count. For now modes 2 and 3 are the same as
+mode 1. The counter has one clock, and the direction must be settled before
+the counting edge, so the step comes on release: DEC sets a direction flip-flop
+when it is pressed, INC clears it, and the counter clock is high only while
+both are low. The count mode is not glitch-free: a write to it may make one
+edge on the counter clock, which can count or load once. So set the mode first,
+and then the count. A mode write while `clk` is low gives the counter one
+clock edge: change the mode while EN is low or `clk` is high, then write the
+count.
 
 Setting the count: a write to COUNT10 or COUNT32 is taken on the next rising
-edge of the counter clock (`clk` in mode 0, INC in the other modes), which loads those two digits instead of counting, whatever EN
+edge of the counter clock (`clk` in mode 0, the release of INC or DEC in the other modes), which loads those two digits instead of counting, whatever EN
 and the direction are. Writing the same value again loads again, and writing
 both registers before one edge loads all four digits on that edge. A digit that
 loads has no carry-out on that edge, and a value at or above the base is taken
@@ -90,7 +99,8 @@ inverse of CO. The reset value of DOT is 0xAA.
 | Pin | Name | Direction | Meaning |
 |-----|------|-----------|---------|
 | ui[0] | EN | in | count enable (carry-in) |
-| ui[1] | INC | in | counter clock in the count modes 1 to 3 |
+| ui[1] | INC | in | counts up on release, count modes 1 to 3 |
+| ui[2] | DEC | in | counts down on release, count modes 1 to 3 |
 | uio[0] | CS | in | SPI chip select, active low |
 | uio[1] | MOSI | in | SPI data in |
 | uio[3] | SCK | in | SPI clock |
@@ -128,6 +138,6 @@ and `uio` pins are unused; `uio[2]` is kept for MISO and is not driven.
 ## External hardware
 
 A 7-segment display on `uo[0]` to `uo[7]` (active high), switches for EN
-(`ui[0]`) and SEL (`uio[4]`, `uio[5]`), an SPI controller (for example the
+(`ui[0]`), push buttons for INC and DEC (`ui[1]`, `ui[2]`) and SEL (`uio[4]`, `uio[5]`), an SPI controller (for example the
 RP2040 on the demo board) on `uio[0]`, `uio[1]` and `uio[3]`, and a slow clock
 source or a push button on `clk`.

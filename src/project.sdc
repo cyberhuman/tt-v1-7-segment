@@ -1,5 +1,5 @@
-# Based on LibreLane's default base.sdc (kept for clk), plus the SPI clock sck and the counter clock inc
-# CLOCK_PORT lists two ports (clk and the SPI clock); clk is the first one
+# Based on LibreLane's default base.sdc (kept for clk), plus the SPI clock sck and the counter clocks inc and dec
+# CLOCK_PORT lists four ports (clk, the SPI clock, INC and DEC); clk is the first one
 set clock_port [lindex $::env(CLOCK_PORT) 0]
 set port_args [get_ports $clock_port]
 puts "\[INFO] Using clock $clock_port…"
@@ -15,7 +15,14 @@ create_clock $sck_port -name sck -period 100
 set inc_port [get_ports {ui_in[1]}]
 create_clock $inc_port -name inc -period 100
 
-set_clock_groups -asynchronous -group [get_clocks $clock_port] -group [get_clocks sck] -group [get_clocks inc]
+# The counter clock DEC is on ui_in[2]: a fourth clock, 100 ns period, asynchronous
+# to the others, treated like inc. It sets the direction flip-flop. The paths from that
+# flip-flop to the counter are between unrelated clocks by this definition; they are
+# separated by the pulse width of INC and DEC, not by STA.
+set dec_port [get_ports {ui_in[2]}]
+create_clock $dec_port -name dec -period 100
+
+set_clock_groups -asynchronous -group [get_clocks $clock_port] -group [get_clocks sck] -group [get_clocks inc] -group [get_clocks dec]
 
 set input_delay_value [expr $::env(CLOCK_PERIOD) * $::env(IO_DELAY_CONSTRAINT) / 100]
 set output_delay_value [expr $::env(CLOCK_PERIOD) * $::env(IO_DELAY_CONSTRAINT) / 100]
@@ -37,6 +44,8 @@ set sck_indx [lsearch $all_inputs_wo_clk $sck_port]
 set all_inputs_wo_clk [lreplace $all_inputs_wo_clk $sck_indx $sck_indx ""]
 set inc_indx [lsearch $all_inputs_wo_clk $inc_port]
 set all_inputs_wo_clk [lreplace $all_inputs_wo_clk $inc_indx $inc_indx ""]
+set dec_indx [lsearch $all_inputs_wo_clk $dec_port]
+set all_inputs_wo_clk [lreplace $all_inputs_wo_clk $dec_indx $dec_indx ""]
 
 #set rst_input [get_port resetn]
 #set rst_indx [lsearch [all_inputs] $rst_input]
@@ -54,11 +63,15 @@ set_output_delay $output_delay_value -clock $clocks [all_outputs]
 set sck_delay_value [expr 100 * $::env(IO_DELAY_CONSTRAINT) / 100]
 set_input_delay $sck_delay_value -clock [get_clocks sck] [get_ports {uio_in[0] uio_in[1]}]
 
+# The counter is clocked when INC or DEC falls, so the delays against inc and dec
+# are referenced to the falling edge (-clock_fall).
 # EN also gates the counter when INC clocks it, so it is timed against inc too,
 # and so are the outputs, which are launched by the counter flip-flops
 set inc_delay_value [expr 100 * $::env(IO_DELAY_CONSTRAINT) / 100]
-set_input_delay $inc_delay_value -clock [get_clocks inc] -add_delay [get_ports {ui_in[0]}]
-set_output_delay $inc_delay_value -clock [get_clocks inc] -add_delay [all_outputs]
+set_input_delay $inc_delay_value -clock_fall -clock [get_clocks inc] -add_delay [get_ports {ui_in[0]}]
+set_output_delay $inc_delay_value -clock_fall -clock [get_clocks inc] -add_delay [all_outputs]
+set_input_delay $inc_delay_value -clock_fall -clock [get_clocks dec] -add_delay [get_ports {ui_in[0]}]
+set_output_delay $inc_delay_value -clock_fall -clock [get_clocks dec] -add_delay [all_outputs]
 
 if { ![info exists ::env(SYNTH_CLK_DRIVING_CELL)] } {
     set ::env(SYNTH_CLK_DRIVING_CELL) $::env(SYNTH_DRIVING_CELL)
@@ -84,6 +97,11 @@ set_driving_cell \
     -pin [lindex [split $::env(SYNTH_CLK_DRIVING_CELL) "/"] 1] \
     $inc_port
 
+set_driving_cell \
+    -lib_cell [lindex [split $::env(SYNTH_CLK_DRIVING_CELL) "/"] 0] \
+    -pin [lindex [split $::env(SYNTH_CLK_DRIVING_CELL) "/"] 1] \
+    $dec_port
+
 set cap_load [expr $::env(OUTPUT_CAP_LOAD) / 1000.0]
 puts "\[INFO] Setting load to: $cap_load"
 set_load $cap_load [all_outputs]
@@ -103,4 +121,3 @@ if { [info exists ::env(OPENLANE_SDC_IDEAL_CLOCKS)] && $::env(OPENLANE_SDC_IDEAL
 } else {
     set_propagated_clock [all_clocks]
 }
-

@@ -37,24 +37,38 @@ def set_sel(dut, sel):
     uio_set(dut, spi_now)
 
 
-# INC is on ui_in bit 1. Like SEL it keeps its level when EN is driven.
+# INC is on ui_in bit 1 and DEC on bit 2. Like SEL they keep their level when
+# EN is driven.
 INC_BIT = 0x02
+DEC_BIT = 0x04
 inc_now = 0
+dec_now = 0
 en_now = 0  # EN last driven
 
 
+def pins_now(dut):
+    dut.ui_in.value = en_now | inc_now * INC_BIT | dec_now * DEC_BIT
+
+
 def set_inc(dut, level):
-    # Change INC only, EN keeps its level
+    # Change INC only, EN and DEC keep their level
     global inc_now
     inc_now = level
-    dut.ui_in.value = en_now | level * INC_BIT
+    pins_now(dut)
+
+
+def set_dec(dut, level):
+    # Change DEC only, EN and INC keep their level
+    global dec_now
+    dec_now = level
+    pins_now(dut)
 
 
 def drive(dut, en, sel):
-    # ui_in bit 0 is EN, bit 1 is INC; SEL goes to uio_in bits 5:4
+    # ui_in bit 0 is EN, bit 1 is INC, bit 2 is DEC; SEL goes to uio_in bits 5:4
     global en_now
     en_now = en
-    dut.ui_in.value = en | inc_now * INC_BIT
+    pins_now(dut)
     set_sel(dut, sel)
 SPI_HALF = 100  # ns, half of one SCK period
 
@@ -62,7 +76,7 @@ SPI_HALF = 100  # ns, half of one SCK period
 # Register addresses
 BASE10, BASE32, MODE, DOT, CTRL, COUNT10, COUNT32 = 0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06
 
-# CTRL bits: 1:0 are the count mode (0 clk, 1 to 3 INC), bit 2 counts down, 7:3 unused
+# CTRL bits: 1:0 are the count mode (0 clk, 1 to 3 INC and DEC), bit 2 counts down, 7:3 unused
 DOWN = 0x04
 
 # DOT values of one digit, and the register value after reset (CO everywhere)
@@ -125,8 +139,9 @@ async def start(dut, en, sel=0, base=None, mode=0, dot=DOT_RESET, ctrl=0):
     # with the bases.
     cocotb.start_soon(Clock(dut.clk, 10, unit="us").start())
     dut.ena.value = 1
-    global inc_now
+    global inc_now, dec_now
     inc_now = 0
+    dec_now = 0
     drive(dut, en, sel)
     uio_set(dut, CS)
     dut.rst_n.value = 0
@@ -1149,71 +1164,197 @@ async def test_ui_in_2_1_select_nothing(dut):
     dut.ui_in.value = 0
 
 
-# INC and the count mode (CTRL bits 1:0)
+# INC, DEC and the count mode (CTRL bits 1:0). In the modes 1 to 3 a step
+# comes when INC or DEC is released: INC counts up, DEC counts down.
 
 async def set_mode(dut, mode, ctrl=0):
-    # Write CTRL = ctrl | mode at a falling edge of clk. The write ends in the
-    # low half of the clock period, with INC low, so the switch makes no edge.
+    # Write CTRL = ctrl | mode while clk is high, with INC and DEC low: the
+    # counter clock is high before and after the switch, so it makes no edge.
+    # The write starts just after a rising edge and ends before the falling one.
     drive(dut, 0, 0)
+    await RisingEdge(dut.clk)
+    await Timer(100, unit="ns")
     await spi_write(dut, CTRL, ctrl | mode)
-
-
-async def inc_pulses(dut, n=1, en=1):
-    # n rising edges on INC, with EN = en. clk keeps running.
-    drive(dut, en, 0)
-    await Timer(200, unit="ns")  # EN settles before the first edge
-    for _ in range(n):
-        set_inc(dut, 1)
-        await Timer(200, unit="ns")
-        set_inc(dut, 0)
-        await Timer(200, unit="ns")
-
-
-async def start_mode(dut, mode, ctrl=0, base=None):
-    # Reset, then the mode at a falling edge of clk
-    await start(dut, 0, base=base)
-    await set_mode(dut, mode, ctrl)
     await FallingEdge(dut.clk)
 
 
+async def press(dut, pins, en=1, hold=200):
+    # One press of each pin of `pins` in turn ("I" for INC, "D" for DEC), each
+    # held for `hold` ns, with EN = en. A step comes when a pin is released.
+    # clk keeps running.
+    drive(dut, en, 0)
+    await Timer(200, unit="ns")  # EN settles before the first edge
+    for c in pins:
+        (set_inc if c == "I" else set_dec)(dut, 1)
+        await Timer(hold, unit="ns")
+        (set_inc if c == "I" else set_dec)(dut, 0)
+        await Timer(200, unit="ns")
+
+
+async def inc_pulses(dut, n=1, en=1):
+    await press(dut, "I" * n, en)
+
+
+async def dec_pulses(dut, n=1, en=1):
+    await press(dut, "D" * n, en)
+
+
+async def start_mode(dut, mode, ctrl=0, base=None):
+    # Reset, then the mode while clk is high
+    await start(dut, 0, base=base)
+    await set_mode(dut, mode, ctrl)
+
+
 @cocotb.test()
-async def test_inc_mode1_clk_does_not_count(dut):
+async def test_inc_mode1_counts_on_release(dut):
     await start_mode(dut, 1)
     await step(dut, 10)
     await check_digits(dut, [0, 0, 0, 0], "clk in mode 1")
     await inc_pulses(dut, 5)
-    await check_digits(dut, [5, 0, 0, 0], "5 INC edges")
-    # The falling edge of INC does not count, nor does a level
+    await check_digits(dut, [5, 0, 0, 0], "5 INC pulses")
+    # Nothing changes while INC is held high, the step comes on the falling edge
+    drive(dut, 1, 0)
     set_inc(dut, 1)
     await step(dut, 3)
-    await check_digits(dut, [6, 0, 0, 0], "INC high, clk running")
+    await Timer(1, unit="us")
+    assert await lit(dut, 0) == PATTERNS[5], "INC held high, clk running"
     set_inc(dut, 0)
+    assert await lit(dut, 0) == PATTERNS[6], "step on the falling edge of INC"
     await step(dut, 3)
-    await check_digits(dut, [6, 0, 0, 0], "INC falls")
+    await check_digits(dut, [6, 0, 0, 0], "no more steps")
 
 
 @cocotb.test()
-async def test_inc_en_gates(dut):
+async def test_dec_mode1_counts_down_on_release(dut):
     await start_mode(dut, 1)
-    await inc_pulses(dut, 3, en=0)
-    await check_digits(dut, [0, 0, 0, 0], "EN = 0", en=0)
-    await inc_pulses(dut, 2, en=1)
-    await check_digits(dut, [2, 0, 0, 0], "EN = 1")
-    await inc_pulses(dut, 3, en=0)
-    await check_digits(dut, [2, 0, 0, 0], "EN = 0 again", en=0)
+    await dec_pulses(dut, 1)
+    await check_digits(dut, [15, 15, 15, 15], "0000 down to FFFF")
+    drive(dut, 1, 0)
+    set_dec(dut, 1)
+    await step(dut, 3)
+    assert await lit(dut, 0) == PATTERNS[15], "DEC held high"
+    set_dec(dut, 0)
+    assert await lit(dut, 0) == PATTERNS[14], "step on the falling edge of DEC"
+    await dec_pulses(dut, 15)
+    await check_digits(dut, [15, 14, 15, 15], "borrow into digit 1")
+    await dec_pulses(dut, 16 * 16 - 15 + 1)
+    await check_digits(dut, [13, 15, 14, 15], "borrow into digits 1, 2")
 
 
 @cocotb.test()
-async def test_inc_ignored_in_mode0(dut):
+async def test_dec_base10_borrow(dut):
+    await start_mode(dut, 1, base=[10, 6, 10, 6])
+    await dec_pulses(dut, 1)
+    await check_digits(dut, [9, 5, 9, 5], "00:00 down to 59:59")
+    await dec_pulses(dut, 10)
+    await check_digits(dut, [9, 4, 9, 5], "borrow")
+
+
+@cocotb.test()
+async def test_inc_inc_dec(dut):
+    await start_mode(dut, 1)
+    await inc_pulses(dut, 3)
+    await press(dut, "IID")
+    await check_digits(dut, [4, 0, 0, 0], "one above the start")
+
+
+@cocotb.test()
+async def test_alternating_both_orders(dut):
+    await start_mode(dut, 1)
+    await inc_pulses(dut, 10)
+    await press(dut, "IDIDID")
+    await check_digits(dut, [10, 0, 0, 0], "I D I D I D")
+    await press(dut, "DIDIDI")
+    await check_digits(dut, [10, 0, 0, 0], "D I D I D I")
+    await press(dut, "DDI")
+    await check_digits(dut, [9, 0, 0, 0], "D D I")
+    await press(dut, "IDD")
+    await check_digits(dut, [8, 0, 0, 0], "I D D")
+
+
+@cocotb.test()
+async def test_first_pulse_after_reset(dut):
+    await start_mode(dut, 1)
+    await press(dut, "D")
+    await check_digits(dut, [15, 15, 15, 15], "first pulse DEC")
+    # DEC, then reset: the next INC counts up
+    dut.rst_n.value = 0
+    await ClockCycles(dut.clk, 3)
+    dut.rst_n.value = 1
+    await FallingEdge(dut.clk)
+    await set_mode(dut, 1)
+    await press(dut, "I")
+    await check_digits(dut, [1, 0, 0, 0], "INC after DEC and reset")
+
+
+@cocotb.test()
+async def test_first_inc_after_reset(dut):
+    await start_mode(dut, 1)
+    await press(dut, "I")
+    await check_digits(dut, [1, 0, 0, 0], "first pulse INC")
+
+
+@cocotb.test()
+async def test_ctrl_down_ignored_in_modes_1_3(dut):
+    await start(dut, 0)
+    for mode in (1, 2, 3):
+        await set_mode(dut, 0)
+        drive(dut, 0, 0)
+        await spi_write(dut, COUNT10, 0)
+        await spi_write(dut, COUNT32, 0)
+        await set_mode(dut, mode, ctrl=DOWN)
+        await inc_pulses(dut, 1, en=0)
+        await check_digits(dut, [0, 0, 0, 0], f"loaded 0, mode {mode}", en=0)
+        await step(dut, 3)
+        await check_digits(dut, [0, 0, 0, 0], f"clk does not count in mode {mode}")
+        await inc_pulses(dut, 3)
+        await check_digits(dut, [3, 0, 0, 0], f"INC counts up, DOWN set, mode {mode}")
+        await dec_pulses(dut, 5)
+        await check_digits(dut, [14, 15, 15, 15], f"DEC counts down, mode {mode}")
+        # DOWN clear: DEC still counts down
+        await set_mode(dut, mode)
+        await dec_pulses(dut, 1)
+        await check_digits(dut, [13, 15, 15, 15], f"DEC with DOWN clear, mode {mode}")
+
+
+@cocotb.test()
+async def test_ctrl_down_works_in_mode0(dut):
+    await start(dut, 1, ctrl=DOWN)
+    await step(dut, 3)
+    await check_digits(dut, [13, 15, 15, 15], "mode 0 counts down")
+    await set_ctrl(dut, 0)
+    drive(dut, 1, 0)
+    await step(dut, 2)
+    await check_digits(dut, [15, 15, 15, 15], "mode 0 counts up again")
+
+
+@cocotb.test()
+async def test_inc_dec_ignored_in_mode0(dut):
     await start(dut, 1)
-    # Between two clk edges: 5 INC edges and the digit is still 0
-    await inc_pulses(dut, 5)
-    assert await lit(dut, 0) == PATTERNS[0], "INC in mode 0"
+    # Between two clk edges the digit stays 0 whatever INC and DEC do
+    await press(dut, "IDIDDI")
+    assert await lit(dut, 0) == PATTERNS[0], "INC and DEC in mode 0"
     await step(dut, 2)
     assert await lit(dut, 0) == PATTERNS[2], "clk counts"
     await FallingEdge(dut.clk)
-    await inc_pulses(dut, 5)
-    assert await lit(dut, 0) == PATTERNS[3], "INC still ignored"
+    await press(dut, "DDD")
+    assert await lit(dut, 0) == PATTERNS[3], "DEC still ignored"
+    # DEC does not change the direction of mode 0
+    await step(dut, 2)
+    assert await lit(dut, 0) == PATTERNS[5], "still counts up"
+
+
+@cocotb.test()
+async def test_en_gates_inc_and_dec(dut):
+    await start_mode(dut, 1)
+    await press(dut, "IDI", en=0)
+    await check_digits(dut, [0, 0, 0, 0], "EN = 0", en=0)
+    await inc_pulses(dut, 2, en=1)
+    await check_digits(dut, [2, 0, 0, 0], "EN = 1")
+    await press(dut, "DDI", en=0)
+    await check_digits(dut, [2, 0, 0, 0], "EN = 0 again", en=0)
+    await dec_pulses(dut, 1, en=1)
+    await check_digits(dut, [1, 0, 0, 0], "DEC with EN = 1")
 
 
 @cocotb.test()
@@ -1224,51 +1365,47 @@ async def test_inc_carry_across_digits(dut):
 
 
 @cocotb.test()
-async def test_inc_wrap_16_bits(dut):
-    await start_mode(dut, 1, ctrl=DOWN)
-    await inc_pulses(dut, 1)
-    await check_digits(dut, [15, 15, 15, 15], "0000 down to FFFF")
-    await inc_pulses(dut, 17)
-    await check_digits(dut, [14, 14, 15, 15], "down with borrow")
-
-
-@cocotb.test()
-async def test_inc_down(dut):
-    await start_mode(dut, 1, ctrl=DOWN, base=[10, 6, 10, 6])
-    await inc_pulses(dut, 1)
-    await check_digits(dut, [9, 5, 9, 5], "00:00 down to 59:59")
-    await inc_pulses(dut, 10)
-    await check_digits(dut, [9, 4, 9, 5], "borrow")
-
-
-@cocotb.test()
 async def test_inc_base10(dut):
     await start_mode(dut, 1, base=10)
     await inc_pulses(dut, 9)
     await check_digits(dut, [9, 0, 0, 0], "9")
     await inc_pulses(dut, 1)
     await check_digits(dut, [0, 1, 0, 0], "wrap to 10")
-    await inc_pulses(dut, 90)
-    await check_digits(dut, [0, 0, 1, 0], "100")
+    await dec_pulses(dut, 1)
+    await check_digits(dut, [9, 0, 0, 0], "borrow back to 9")
 
 
 @cocotb.test()
-async def test_inc_count_loads_on_next_inc_edge(dut):
+async def test_count_loads_on_release_of_inc(dut):
     await start_mode(dut, 1)
     await inc_pulses(dut, 2)
     await spi_write(dut, COUNT10, 0x34)
     await spi_write(dut, COUNT32, 0x12)
-    # clk edges do not load
+    # clk edges do not load, nor does a press held high
     await step(dut, 3)
     await check_digits(dut, [2, 0, 0, 0], "written, not loaded by clk", en=0)
-    await inc_pulses(dut, 1)
-    await check_digits(dut, [4, 3, 2, 1], "loaded, load edge does not count")
+    set_inc(dut, 1)
+    await Timer(1, unit="us")
+    await check_digits(dut, [2, 0, 0, 0], "INC held high", en=0)
+    set_inc(dut, 0)
+    await check_digits(dut, [4, 3, 2, 1], "loaded on release, load edge does not count")
     await inc_pulses(dut, 1)
     await check_digits(dut, [5, 3, 2, 1], "counts after the load")
     # Writing the same value again loads again, with EN = 0 too
     await spi_write(dut, COUNT10, 0x34)
     await inc_pulses(dut, 1, en=0)
     await check_digits(dut, [4, 3, 2, 1], "same value again", en=0)
+
+
+@cocotb.test()
+async def test_count_loads_on_release_of_dec(dut):
+    await start_mode(dut, 1)
+    await spi_write(dut, COUNT10, 0x34)
+    await spi_write(dut, COUNT32, 0x12)
+    await dec_pulses(dut, 1)
+    await check_digits(dut, [4, 3, 2, 1], "loaded on DEC release, not counted down")
+    await dec_pulses(dut, 1)
+    await check_digits(dut, [3, 3, 2, 1], "counts down after the load")
 
 
 @cocotb.test()
@@ -1279,8 +1416,10 @@ async def test_inc_modes_2_3(dut):
         await check_digits(dut, [0, 0, 0, 0], f"clk in mode {mode}")
         await inc_pulses(dut, 18)
         await check_digits(dut, [2, 1, 0, 0], f"INC in mode {mode}")
-        await inc_pulses(dut, 2, en=0)
-        await check_digits(dut, [2, 1, 0, 0], f"EN = 0 in mode {mode}", en=0)
+        await dec_pulses(dut, 1)
+        await check_digits(dut, [1, 1, 0, 0], f"DEC in mode {mode}")
+        await press(dut, "II", en=0)
+        await check_digits(dut, [1, 1, 0, 0], f"EN = 0 in mode {mode}", en=0)
 
 
 @cocotb.test()
@@ -1288,22 +1427,36 @@ async def test_mode_switch_no_step(dut):
     await start(dut, 1)
     await step(dut, 3)
     assert await lit(dut, 0) == PATTERNS[3], "clk counts"
-    # 0 -> 1 with clk low and INC low: no step, and clk no longer counts
+    # 0 -> 1 with clk high, INC and DEC low: no step, and clk no longer counts.
+    # (With clk low the switch would give the counter clock a rising edge.)
     await set_mode(dut, 1)
     assert await lit(dut, 0) == PATTERNS[3]
     await step(dut, 3)
     await check_digits(dut, [3, 0, 0, 0], "mode 1, clk running")
     await inc_pulses(dut, 2)
     await check_digits(dut, [5, 0, 0, 0], "mode 1 counts INC")
-    # 1 -> 0 with clk low and INC low: no step, then clk counts, INC does not
-    await FallingEdge(dut.clk)
+    # 1 -> 0 with clk high: no step, then clk counts, INC and DEC do not
     await set_mode(dut, 0)
     assert await lit(dut, 0) == PATTERNS[5]
     await step(dut, 1)
     await check_digits(dut, [6, 0, 0, 0], "clk counts again")
     await FallingEdge(dut.clk)
-    await inc_pulses(dut, 3)
-    assert await lit(dut, 0) == PATTERNS[7], "INC ignored again"
+    await press(dut, "IDI")
+    assert await lit(dut, 0) == PATTERNS[7], "INC and DEC ignored again"
+
+
+@cocotb.test()
+async def test_mode_switch_clk_low_en_low_no_step(dut):
+    # With clk low a mode write gives the counter clock one edge (0 -> 1
+    # rises, 1 -> 0 falls); with EN = 0 that edge counts nothing
+    await start(dut, 1)
+    await step(dut, 3)
+    drive(dut, 0, 0)
+    await spi_write(dut, CTRL, 1)  # at a falling edge of clk, clk low
+    await check_digits(dut, [3, 0, 0, 0], "0 -> 1, clk low, EN = 0", en=0)
+    await FallingEdge(dut.clk)
+    await spi_write(dut, CTRL, 0)
+    await check_digits(dut, [3, 0, 0, 0], "1 -> 0, clk low, EN = 0", en=0)
 
 
 @cocotb.test()
@@ -1318,19 +1471,5 @@ async def test_reset_returns_mode0(dut):
     await step(dut, 2)
     assert await lit(dut, 0) == PATTERNS[2], "clk counts after reset"
     await FallingEdge(dut.clk)
-    await inc_pulses(dut, 4)
-    assert await lit(dut, 0) == PATTERNS[3], "INC ignored after reset"
-
-
-@cocotb.test()
-async def test_ctrl_down_and_mode_together(dut):
-    await start_mode(dut, 1, ctrl=DOWN)
-    await step(dut, 3)
-    await check_digits(dut, [0, 0, 0, 0], "clk does not count")
-    await inc_pulses(dut, 3)
-    await check_digits(dut, [13, 15, 15, 15], "INC counts down")
-    # Mode alone in CTRL: counts up again on INC
-    await set_mode(dut, 1)
-    await FallingEdge(dut.clk)
-    await inc_pulses(dut, 2)
-    await check_digits(dut, [15, 15, 15, 15], "mode 1 alone counts up")
+    await press(dut, "IDID")
+    assert await lit(dut, 0) == PATTERNS[3], "INC and DEC ignored after reset"

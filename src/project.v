@@ -103,7 +103,7 @@ module settings (
     output reg  [7:0] mode,   // display mode of each digit, 2 bits each, digit 0 in bits 1:0
     output reg  [7:0] dot,    // what bit 7 shows for each digit, 2 bits each, digit 0 in bits 1:0
     output reg        down,   // count direction of all digits: 0 up, 1 down
-    output reg  [1:0] count_mode,  // what clocks the counter: 0 is clk, 1 to 3 is INC
+    output reg  [1:0] count_mode,  // what clocks the counter: 0 is clk, 1 to 3 is INC and DEC
     output reg  [7:0] count10,  // held count of digits 1 and 0 (digit 1 in bits 7:4)
     output reg  [7:0] count32,  // held count of digits 3 and 2 (digit 3 in bits 7:4)
     output reg        tgl10,  // flips on every write to COUNT10
@@ -220,12 +220,34 @@ module tt_um_cyberhuman_7segment (
   settings settings0 (.sck, .cs_n, .mosi, .rst_n, .mode, .dot, .down, .count_mode, .count10, .count32,
                       .tgl10, .tgl32, .base0, .base1, .base2, .base3);
 
-  // INC is the counter clock in the modes 1 to 3, it comes from input pin 1
+  // INC counts up and DEC counts down in the modes 1 to 3. They come from
+  // input pins 1 and 2. A step happens when the pressed input is released.
+  // Why: the counter has one clock, and the direction must be settled before
+  // the counting edge. So the direction is taken on the press, and the
+  // counter clock is high only while both inputs are low: its rising edge is
+  // the moment the pressed input is released.
   wire inc = ui_in[1];
+  wire dec = ui_in[2];
 
-  // The counter clock: clk in mode 0, INC in the other modes. This is a plain
-  // switch, not glitch-free: a write to the mode may give one edge on it.
-  wire count_clk = (count_mode == 2'd0) ? clk : inc;
+  // The direction flip-flop: the rising edge of DEC sets it (D is constant 1),
+  // INC high clears it (INC wins if both are high), and so does reset (an OR
+  // of the two on the one asynchronous clear). It is used in the modes 1 to 3
+  // only. Its paths to the counter are between unrelated clocks for STA (see
+  // project.sdc); they are separated by the pulse width, not by STA.
+  wire dec_clr = inc | ~rst_n;
+  reg  dec_dir;
+  always @(posedge dec or posedge dec_clr) begin
+    if (dec_clr) dec_dir <= 1'b0;
+    else         dec_dir <= 1'b1;
+  end
+
+  // The counter clock: clk in mode 0, in the other modes high while INC and
+  // DEC are both low. This is a plain switch, not glitch-free: a write to the
+  // mode makes an edge on it unless clk is high (and INC and DEC low).
+  wire count_clk = (count_mode == 2'd0) ? clk : ~(inc | dec);
+
+  // The direction of the digits: CTRL bit 2 in mode 0, DEC in the other modes
+  wire count_down = (count_mode == 2'd0) ? down : dec_dir;
 
   // Loading a count: each write to COUNT10 or COUNT32 flips a toggle bit on
   // the SCK side. Here a copy of each toggle bit is kept on the counter clock. When the two
@@ -254,10 +276,10 @@ module tt_um_cyberhuman_7segment (
   // together a 16-bit counter 0000..FFFF; bases 10, 6, 10, 6 make a clock
   // 00:00..59:59). The lowest digit counts when EN is 1, each next digit
   // counts when the digit before it has a carry-out (counting down, a borrow).
-  digit digit0 (.clk(count_clk), .rst_n, .en,      .base(base0), .down, .load(load10), .value(count10[3:0]), .seg(seg0), .co(co0), .zero(zero0));
-  digit digit1 (.clk(count_clk), .rst_n, .en(co0), .base(base1), .down, .load(load10), .value(count10[7:4]), .seg(seg1), .co(co1), .zero(zero1));
-  digit digit2 (.clk(count_clk), .rst_n, .en(co1), .base(base2), .down, .load(load32), .value(count32[3:0]), .seg(seg2), .co(co2), .zero(zero2));
-  digit digit3 (.clk(count_clk), .rst_n, .en(co2), .base(base3), .down, .load(load32), .value(count32[7:4]), .seg(seg3), .co(co3), .zero(zero3));
+  digit digit0 (.clk(count_clk), .rst_n, .en,      .base(base0), .down(count_down), .load(load10), .value(count10[3:0]), .seg(seg0), .co(co0), .zero(zero0));
+  digit digit1 (.clk(count_clk), .rst_n, .en(co0), .base(base1), .down(count_down), .load(load10), .value(count10[7:4]), .seg(seg1), .co(co1), .zero(zero1));
+  digit digit2 (.clk(count_clk), .rst_n, .en(co1), .base(base2), .down(count_down), .load(load32), .value(count32[3:0]), .seg(seg2), .co(co2), .zero(zero2));
+  digit digit3 (.clk(count_clk), .rst_n, .en(co2), .base(base3), .down(count_down), .load(load32), .value(count32[7:4]), .seg(seg3), .co(co3), .zero(zero3));
 
   // What each digit shows, by its 2-bit display mode (the segments only, CO
   // is not affected): 0 = the digit as is, 1 = the digit unless its own
@@ -306,6 +328,6 @@ module tt_um_cyberhuman_7segment (
   assign uio_oe  = 0;
 
   // List all unused inputs to prevent warnings
-  wire _unused = &{ena, uio_in[7:6], uio_in[2], ui_in[7:2], 1'b0};
+  wire _unused = &{ena, uio_in[7:6], uio_in[2], ui_in[7:3], 1'b0};
 
 endmodule
