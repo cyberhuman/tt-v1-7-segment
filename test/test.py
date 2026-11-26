@@ -20,25 +20,27 @@ CS, MOSI, SCK = 0x01, 0x02, 0x08
 SPI_HALF = 100  # ns, half of one SCK period
 
 
-def frame(*bases):
-    # The 16-bit frame for the given bases. One base is used for all four
-    # digits, four bases are given for digits 0..3 (digit 3 goes first).
+def frame(*bases, pad=0):
+    # The 24-bit frame for the given bases and pad bits (bit n is digit n).
+    # One base is used for all four digits, four bases are given for digits
+    # 0..3 (digit 3 goes first). The 4 top bits are unused and sent as 0.
     if len(bases) == 1:
         bases = bases * 4
     assert len(bases) == 4
-    return sum((b & 0xF) << (4 * d) for d, b in enumerate(bases))
+    return ((pad & 0xF) << 16) | sum(
+        (b & 0xF) << (4 * d) for d, b in enumerate(bases))
 
 
-async def spi_write(dut, value, bits=16):
+async def spi_write(dut, value, bits=24):
     # Bit-bang one SPI frame, mode 0, MSB first, CS idle high. MOSI changes
-    # while SCK is low and is sampled on the rising edge. Fewer bits than 16
+    # while SCK is low and is sampled on the rising edge. Fewer bits than 24
     # make a cut-short frame (the first bits of the value are sent). The whole
-    # write takes 3.3 us, well inside half a clock cycle (5 us), so it fits
+    # write takes 5 us, well inside half a clock cycle (5 us), so it fits
     # between clock edges.
     dut.uio_in.value = 0            # CS low, SCK low
     await Timer(SPI_HALF, unit="ns")
     for i in range(bits):
-        bit = (value >> (15 - i)) & 1
+        bit = (value >> (23 - i)) & 1
         dut.uio_in.value = bit * MOSI
         await Timer(SPI_HALF, unit="ns")
         dut.uio_in.value = bit * MOSI | SCK
@@ -49,9 +51,10 @@ async def spi_write(dut, value, bits=16):
     await Timer(SPI_HALF, unit="ns")
 
 
-async def start(dut, en, sel=0, base=None):
+async def start(dut, en, sel=0, base=None, pad=0):
     # Start the clock, hold reset for a few cycles, then release it.
     # base is one number for all digits, or a list of four (digit 0 first).
+    # pad is the 4 pad bits (bit n is digit n), written with the bases.
     cocotb.start_soon(Clock(dut.clk, 10, unit="us").start())
     dut.ena.value = 1
     dut.ui_in.value = ui(en, sel)
@@ -63,10 +66,11 @@ async def start(dut, en, sel=0, base=None):
     await FallingEdge(dut.clk)
     # Reset clears the bases, so they are written after reset. EN is held at 0
     # during the write and one clock cycle, so the count stays at 0.
-    if base is not None:
+    if base is not None or pad:
+        base = 0 if base is None else base
         bases = base if isinstance(base, (list, tuple)) else [base]
         dut.ui_in.value = ui(0, sel)
-        await spi_write(dut, frame(*bases))
+        await spi_write(dut, frame(*bases, pad=pad))
         await FallingEdge(dut.clk)
         dut.ui_in.value = ui(en, sel)
 
@@ -262,7 +266,7 @@ async def test_base_default_16(dut):
 @cocotb.test()
 async def test_spi_short_frame_ignored(dut):
     await start(dut, 1, base=10)
-    await spi_write(dut, frame(3), bits=15)   # cut short
+    await spi_write(dut, frame(3), bits=23)   # cut short
     await spi_write(dut, frame(0), bits=3)
     assert await read_base(dut) == 9
 
@@ -270,8 +274,8 @@ async def test_spi_short_frame_ignored(dut):
 @cocotb.test()
 async def test_spi_cs_high_ignored(dut):
     await start(dut, 1, base=10)
-    # SCK edges with CS high: sixteen clocks carrying 1s, nothing happens
-    for _ in range(16):
+    # SCK edges with CS high: 24 clocks carrying 1s, nothing happens
+    for _ in range(24):
         dut.uio_in.value = CS | MOSI | SCK
         await Timer(SPI_HALF, unit="ns")
         dut.uio_in.value = CS | MOSI
@@ -282,12 +286,12 @@ async def test_spi_cs_high_ignored(dut):
 @cocotb.test()
 async def test_spi_two_frames_second_wins(dut):
     await start(dut, 1)
-    # Two frames in one CS-low period: 32 SCK edges, the second frame wins
+    # Two frames in one CS-low period: 48 SCK edges, the second frame wins
     dut.uio_in.value = 0
     await Timer(SPI_HALF, unit="ns")
     for value in (frame(0xA), frame(3)):
-        for i in range(16):
-            bit = (value >> (15 - i)) & 1
+        for i in range(24):
+            bit = (value >> (23 - i)) & 1
             dut.uio_in.value = bit * MOSI
             await Timer(SPI_HALF, unit="ns")
             dut.uio_in.value = bit * MOSI | SCK
@@ -360,3 +364,96 @@ async def test_reset_returns_base_16(dut):
     dut.rst_n.value = 1
     await FallingEdge(dut.clk)
     assert await read_base(dut) == 15
+
+
+async def step(dut, n=1):
+    # n clock cycles with EN = 1
+    dut.ui_in.value = ui(1, 0)
+    for _ in range(n):
+        await FallingEdge(dut.clk)
+
+
+@cocotb.test()
+async def test_pad_blank_leading(dut):
+    await start(dut, 1, base=10, pad=0b1110)
+    # 0000: digit 0 is not padded and shows 0, digits 1..3 are blank
+    assert await read_digits(dut) == [PATTERNS[0], 0, 0, 0]
+    await step(dut, 5)
+    # 0005: digit 0 lit, digits 1..3 blank
+    assert await read_digits(dut) == [PATTERNS[5], 0, 0, 0]
+    await step(dut, 100)
+    # 0105: digit 1 is a 0 that is not leading and shows, digit 3 is blank
+    assert await read_digits(dut) == [PATTERNS[5], PATTERNS[0], PATTERNS[1], 0]
+    await step(dut, 899)
+    # 1004: digit 3 is not 0, so nothing is blank
+    assert await read_digits(dut) == [PATTERNS[4], PATTERNS[0], PATTERNS[0], PATTERNS[1]]
+
+
+@cocotb.test()
+async def test_pad_blank_all(dut):
+    await start(dut, 1, base=10, pad=0b1111)
+    # 0000 is all blank, 0001 shows the 1 only
+    assert await read_digits(dut) == [0, 0, 0, 0]
+    await step(dut)
+    assert await read_digits(dut) == [PATTERNS[1], 0, 0, 0]
+
+
+@cocotb.test()
+async def test_pad_with_base_16(dut):
+    # Bases 0 (= 16) with all pad bits: 0000 blank, 0010 keeps digit 0 lit
+    await start(dut, 1, pad=0b1111)
+    assert await read_digits(dut) == [0, 0, 0, 0]
+    await step(dut, 16)
+    assert await read_digits(dut) == [PATTERNS[0], PATTERNS[1], 0, 0]
+
+
+@cocotb.test()
+async def test_pad_bit_clear_keeps_zero(dut):
+    # Pad bits on digits 3 and 1 only: digit 2 keeps its 0, digit 1 is blank
+    # while digits 2 and 3 are 0 (digit 2 is, so blank)
+    await start(dut, 1, base=10, pad=0b1010)
+    assert await read_digits(dut) == [PATTERNS[0], 0, PATTERNS[0], 0]
+    await step(dut, 100)
+    # 0100: digit 2 is 1, so digit 1 (a 0 that is not leading) shows
+    assert await read_digits(dut) == [PATTERNS[0], PATTERNS[0], PATTERNS[1], 0]
+
+
+@cocotb.test()
+async def test_pad_digit3_alone(dut):
+    # Digit 3 depends only on itself: pad bit 3 blanks it while it is 0
+    await start(dut, 1, base=10, pad=0b1000)
+    await step(dut, 37)
+    assert await read_digits(dut) == [PATTERNS[7], PATTERNS[3], PATTERNS[0], 0]
+
+
+@cocotb.test()
+async def test_pad_co_unchanged(dut):
+    # Base 1 on digit 0: it stays 0 and CO is high with EN = 1. Digit 0 is
+    # blank (pad bit set), CO still follows EN.
+    await start(dut, 1, base=[1, 10, 10, 10], pad=0b1111)
+    dut.ui_in.value = ui(1, 0)
+    await Timer(1, unit="us")
+    assert dut.uo_out.value == 0x80, "blank digit with CO high"
+    dut.ui_in.value = ui(0, 0)
+    await Timer(1, unit="us")
+    assert dut.uo_out.value == 0x00, "blank digit with CO low"
+
+
+@cocotb.test()
+async def test_spi_16_bit_frame_ignored(dut):
+    await start(dut, 1, base=10, pad=0b1110)
+    # A 16-bit frame is cut short now: the pad bits and bases stay
+    await spi_write(dut, frame(3), bits=16)
+    assert await read_digits(dut) == [PATTERNS[0], 0, 0, 0]
+    assert await read_base(dut) == 9
+
+
+@cocotb.test()
+async def test_reset_clears_pad(dut):
+    await start(dut, 1, base=10, pad=0b1111)
+    assert await read_digits(dut) == [0, 0, 0, 0]
+    dut.rst_n.value = 0
+    await ClockCycles(dut.clk, 3)
+    dut.rst_n.value = 1
+    await FallingEdge(dut.clk)
+    assert await read_digits(dut) == [PATTERNS[0]] * 4
