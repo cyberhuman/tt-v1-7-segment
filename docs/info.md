@@ -55,6 +55,8 @@ carry-out of the digit or its inverse. The display shows one digit at a time.
 | 0x02 | MODE | 7:6 mode of digit 3, 5:4 digit 2, 3:2 digit 1, 1:0 digit 0 |
 | 0x03 | DOT | 7:6 dot of digit 3, 5:4 digit 2, 3:2 digit 1, 1:0 digit 0 |
 | 0x04 | CTRL | 2 DOWN (0 counts up, 1 counts down); 1:0 reserved, 7:3 unused |
+| 0x05 | COUNT10 | 7:4 count of digit 1, 3:0 count of digit 0 |
+| 0x06 | COUNT32 | 7:4 count of digit 3, 3:0 count of digit 2 |
 
 Display modes: 0 shows the digit, 1 shows it unless its own count is 0 (then
 all segments are off), 2 shows nothing, 3 shows a minus (segment G only).
@@ -64,6 +66,13 @@ digit at 0 wraps to the last digit of its base (F for base 16). A digit steps
 when the digit before it wraps, so 0000 goes to FFFF, and with bases 10, 6, 10,
 6 the clock goes from 00:00 to 59:59. CO is then the borrow: high while EN = 1
 and that digit and all the digits below it are 0. After reset it counts up.
+
+Setting the count: a write to COUNT10 or COUNT32 is taken on the next rising
+edge of `clk`, which loads those two digits instead of counting, whatever EN
+and the direction are. Writing the same value again loads again, and writing
+both registers before one edge loads all four digits on that edge. A digit that
+loads has no carry-out on that edge, and a value at or above the base is taken
+as is. Reset clears the written values, so it never causes a load.
 
 Dot values: 0 is off (bit 7 low), 1 is on (bit 7 high), 2 is CO, 3 is the
 inverse of CO. The reset value of DOT is 0xAA.
