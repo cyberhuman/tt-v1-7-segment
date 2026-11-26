@@ -22,7 +22,10 @@ SPI_HALF = 100  # ns, half of one SCK period
 
 
 # Register addresses
-BASE10, BASE32, MODE, DOT = 0x00, 0x01, 0x02, 0x03
+BASE10, BASE32, MODE, DOT, CTRL = 0x00, 0x01, 0x02, 0x03, 0x04
+
+# CTRL bits: bit 2 counts down (bits 1:0 are reserved, 7:3 unused)
+DOWN = 0x04
 
 # DOT values of one digit, and the register value after reset (CO everywhere)
 DOT_OFF, DOT_ON, DOT_CO, DOT_NCO = 0, 1, 2, 3
@@ -61,24 +64,27 @@ async def spi_write(dut, address, value, bits=16):
     await spi_writes(dut, (address, value), bits=bits)
 
 
-async def write_settings(dut, base=0, mode=0, dot=DOT_RESET):
+async def write_settings(dut, base=0, mode=0, dot=DOT_RESET, ctrl=0):
     # Write the bases and the modes. base is one number for all digits, or a
     # list of four (digit 0 first); mode is the MODE register value (2 bits
     # per digit, digit 0 in bits 1:0); dot is the DOT register value in the
-    # same layout, written only when it differs from the reset value.
+    # same layout, written only when it differs from the reset value; ctrl is
+    # the CTRL register value, written only when it is not 0.
     bases = list(base) if isinstance(base, (list, tuple)) else [base] * 4
     assert len(bases) == 4
     await spi_writes(dut,
                      (BASE10, (bases[1] & 0xF) << 4 | bases[0] & 0xF),
                      (BASE32, (bases[3] & 0xF) << 4 | bases[2] & 0xF),
                      (MODE, mode & 0xFF),
-                     *([(DOT, dot & 0xFF)] if dot != DOT_RESET else []))
+                     *([(DOT, dot & 0xFF)] if dot != DOT_RESET else []),
+                     *([(CTRL, ctrl & 0xFF)] if ctrl else []))
 
 
-async def start(dut, en, sel=0, base=None, mode=0, dot=DOT_RESET):
+async def start(dut, en, sel=0, base=None, mode=0, dot=DOT_RESET, ctrl=0):
     # Start the clock, hold reset for a few cycles, then release it.
     # base is one number for all digits, or a list of four (digit 0 first).
-    # mode and dot are the MODE and DOT register values, written with the bases.
+    # mode, dot and ctrl are the MODE, DOT and CTRL register values, written
+    # with the bases.
     cocotb.start_soon(Clock(dut.clk, 10, unit="us").start())
     dut.ena.value = 1
     dut.ui_in.value = ui(en, sel)
@@ -90,9 +96,9 @@ async def start(dut, en, sel=0, base=None, mode=0, dot=DOT_RESET):
     await FallingEdge(dut.clk)
     # Reset clears the registers, so they are written after reset. EN is held
     # at 0 during the write and one clock cycle, so the count stays at 0.
-    if base is not None or mode or dot != DOT_RESET:
+    if base is not None or mode or dot != DOT_RESET or ctrl:
         dut.ui_in.value = ui(0, sel)
-        await write_settings(dut, 0 if base is None else base, mode, dot)
+        await write_settings(dut, 0 if base is None else base, mode, dot, ctrl)
         await FallingEdge(dut.clk)
         dut.ui_in.value = ui(en, sel)
 
@@ -393,7 +399,7 @@ async def test_cut_short_then_full_same_cs(dut):
 @cocotb.test()
 async def test_read_bit_set_ignored(dut):
     await start_preset(dut)
-    for address in (0x80 | BASE10, 0x80 | BASE32, 0x80 | MODE, 0x80 | DOT, 0xFF):
+    for address in (0x80 | BASE10, 0x80 | BASE32, 0x80 | MODE, 0x80 | DOT, 0x80 | CTRL, 0xFF):
         await spi_write(dut, address, 0x33)
     assert await read_settings(dut) == PRESET
 
@@ -401,7 +407,7 @@ async def test_read_bit_set_ignored(dut):
 @cocotb.test()
 async def test_unused_address_ignored(dut):
     await start_preset(dut)
-    for address in (0x04, 0x05, 0x10, 0x7F):
+    for address in (0x05, 0x06, 0x10, 0x7F):
         await spi_write(dut, address, 0x33)
     assert await read_settings(dut) == PRESET
     # The address is decoded in full: a register address with a high bit set
@@ -663,3 +669,189 @@ async def test_reset_returns_dot(dut):
     # CO of digit 0 is high at F: the value is 0xAA, not 0x00
     await step(dut, 15)
     assert await dp(dut, 0) == 1
+
+
+def after_down(n, bases):
+    # The four digits (lowest first) after n steps down from 0000, with the
+    # given bases (0 means 16): the value is the mixed-base number, modulo
+    # the product of the bases.
+    bases = [b or 16 for b in bases]
+    total = bases[0] * bases[1] * bases[2] * bases[3]
+    value = -n % total
+    digits, weight = [], 1
+    for b in bases:
+        digits.append(value // weight % b)
+        weight *= b
+    return digits
+
+
+async def check_digits(dut, digits, what):
+    assert await read_digits(dut) == [PATTERNS[d] for d in digits], what
+
+
+async def set_ctrl(dut, value):
+    # Write CTRL with EN = 0, so no clock edge counts in the old direction
+    # while the write is on its way, and stop at a falling edge
+    dut.ui_in.value = ui(0, 0)
+    await spi_write(dut, CTRL, value)
+    await FallingEdge(dut.clk)
+
+
+@cocotb.test()
+async def test_down_base16(dut):
+    await start(dut, 1, ctrl=DOWN)
+    await check_digits(dut, [0, 0, 0, 0], "0000")
+    await step(dut)
+    await check_digits(dut, [15, 15, 15, 15], "FFFF")
+    await step(dut)
+    await check_digits(dut, [14, 15, 15, 15], "FFFE")
+    for n in range(3, 0x130):
+        await step(dut)
+        await check_digits(dut, after_down(n, [0] * 4), f"step {n}")
+
+
+@cocotb.test()
+async def test_down_base10(dut):
+    await start(dut, 1, base=10, ctrl=DOWN)
+    await step(dut)
+    await check_digits(dut, [9, 9, 9, 9], "9999")
+    # From 0100 one step gives 0099
+    await step(dut, 9899)
+    await check_digits(dut, [0, 0, 1, 0], "0100")
+    await step(dut)
+    await check_digits(dut, [9, 9, 0, 0], "0099")
+
+
+@cocotb.test()
+async def test_down_clock(dut):
+    await start(dut, 1, base=[10, 6, 10, 6], ctrl=DOWN)
+    await step(dut)
+    await check_digits(dut, [9, 5, 9, 5], "59:59")
+    for n in range(2, 3601):
+        await step(dut)
+        await check_digits(dut, after_down(n, [10, 6, 10, 6]), f"step {n}")
+    # 3600 steps down is a full round (checked above: back at 00:00), then
+    # 59:59 again
+    await step(dut)
+    await check_digits(dut, [9, 5, 9, 5], "59:59 again")
+
+
+@cocotb.test()
+async def test_down_borrow_on_dot(dut):
+    # DOT is CO after reset: counting down it shows the borrow
+    await start(dut, 1, base=10, ctrl=DOWN)
+    for n in range(130):
+        digits = after_down(n, [10] * 4)
+        expected = [int(all(d == 0 for d in digits[:i + 1])) for i in range(4)]
+        assert await dots(dut, 1) == expected, f"step {n}"
+        await step(dut)
+    # With EN = 0 the borrow is low everywhere
+    assert await dots(dut, 0) == [0] * 4
+    # Counting down, a digit that is not 0 has no borrow, even at its base - 1
+    await start(dut, 1, base=4, ctrl=DOWN)
+    await step(dut)
+    assert await dots(dut, 1) == [0] * 4, "0003 in base 4: no borrow"
+
+
+@cocotb.test()
+async def test_down_after_up_returns(dut):
+    await start(dut, 1, base=[10, 6, 10, 6])
+    await step(dut, 1234)
+    before = await read_digits(dut)
+    assert before == [PATTERNS[d] for d in [4, 3, 0, 2]], "1234 steps up"
+    await set_ctrl(dut, DOWN)
+    for n in range(1233, -1, -1):
+        await step(dut)
+        await check_digits(dut, [n % 10, n // 10 % 6, n // 60 % 10, n // 600 % 6], f"back at {n}")
+
+
+@cocotb.test()
+async def test_down_en_holds(dut):
+    await start(dut, 1, base=10, ctrl=DOWN)
+    await step(dut, 5)
+    before = await read_digits(dut, en=0)
+    assert before == [PATTERNS[d] for d in [5, 9, 9, 9]]
+    await ClockCycles(dut.clk, 25)
+    assert await read_digits(dut, en=0) == before
+    assert await dots(dut, 0) == [0] * 4
+
+
+@cocotb.test()
+async def test_direction_switch_between_steps(dut):
+    bases = [10, 6, 10, 6]
+    await start(dut, 1, base=bases)
+    value = 0                                # the mixed-base value, mod 3600
+    # Up, down across the wrap below 0000, up again across it, down again
+    for direction, steps in ((0, 7), (1, 20), (0, 15), (1, 8), (0, 40), (1, 3), (0, 1)):
+        await set_ctrl(dut, DOWN if direction else 0)
+        for _ in range(steps):
+            await step(dut)
+            value = (value + (-1 if direction else 1)) % 3600
+            await check_digits(dut, [value % 10, value // 10 % 6, value // 60 % 10, value // 600 % 6],
+                               f"direction {direction}")
+
+
+@cocotb.test()
+async def test_ctrl_reserved_bits_ignored(dut):
+    await start_preset(dut)
+    # Every value without bit 2 counts up, and changes no other register
+    for value in (0x00, 0x01, 0x02, 0x03, 0xF8, 0xFB):
+        await spi_write(dut, CTRL, value)
+        assert await read_settings(dut) == PRESET, f"CTRL {value:02X}"
+    # Every value with bit 2 counts down, the same way
+    for value in (0x04, 0x05, 0x06, 0x07, 0xFC, 0xFF):
+        await start(dut, 1, base=10)
+        await spi_write(dut, CTRL, value)
+        await step(dut)
+        await check_digits(dut, [9, 9, 9, 9], f"CTRL {value:02X}")
+        await step(dut)
+        await check_digits(dut, [8, 9, 9, 9], f"CTRL {value:02X}")
+        # Writing it again with other reserved bits changes nothing
+        await set_ctrl(dut, 0xFF if value < 0xFC else 0x04)
+        await step(dut)
+        await check_digits(dut, [7, 9, 9, 9], f"CTRL {value:02X} again")
+
+
+@cocotb.test()
+async def test_ctrl_alone(dut):
+    # Digit modes 1 (blank 0), bases 3, 4, 5, 6; dots off, on, CO, inverse CO
+    await start(dut, 0, base=[3, 4, 5, 6], mode=0x55, dot=0b11_10_01_00)
+    await spi_write(dut, CTRL, DOWN)
+    await FallingEdge(dut.clk)
+    for n in range(130):
+        digits = after_down(n, [3, 4, 5, 6])
+        zeros = [int(all(d == 0 for d in digits[:i + 1])) for i in range(4)]
+        # All four digits with EN = 1 in one pass: segments and dot together
+        out = []
+        for sel in range(4):
+            dut.ui_in.value = ui(1, sel)
+            await Timer(1, unit="us")
+            out.append(int(dut.uo_out.value))
+        assert [o & 0x7F for o in out] == [0 if d == 0 else PATTERNS[d] for d in digits], f"step {n}"
+        assert [o >> 7 for o in out] == [0, 1, zeros[2], 1 - zeros[3]], f"step {n}"
+        await step(dut)
+    # The other registers leave CTRL alone: still counting down
+    dut.ui_in.value = ui(0, 0)
+    await spi_writes(dut, (MODE, 0x00), (DOT, DOT_RESET), (BASE10, 0x43), (BASE32, 0x65))
+    await FallingEdge(dut.clk)
+    digits = after_down(130, [3, 4, 5, 6])
+    await check_digits(dut, digits, "registers written")
+    await step(dut)
+    await check_digits(dut, after_down(131, [3, 4, 5, 6]), "still down")
+
+
+@cocotb.test()
+async def test_reset_returns_up(dut):
+    await start(dut, 1, base=10, ctrl=DOWN)
+    await step(dut, 3)
+    await check_digits(dut, [7, 9, 9, 9], "down before reset")
+    dut.rst_n.value = 0
+    await ClockCycles(dut.clk, 3)
+    dut.rst_n.value = 1
+    await FallingEdge(dut.clk)
+    await check_digits(dut, [0, 0, 0, 0], "after reset")
+    await step(dut, 3)
+    await check_digits(dut, [3, 0, 0, 0], "counts up after reset")
+    # Bases are 16 again too
+    await step(dut, 12)
+    await check_digits(dut, [15, 0, 0, 0], "base 16")

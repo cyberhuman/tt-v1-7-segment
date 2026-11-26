@@ -40,7 +40,7 @@ carry-out of the digit or its inverse. The display shows one digit at a time.
   no MISO yet.
 - `rst_n` (active low) clears the counter, so all four digits are 0, sets all
   four bases to 16, all display modes to 0 (every digit is shown as is) and
-  all DOT values to 2 (the decimal point is CO). A mode changes the segments
+  all DOT values to 2 (the decimal point is CO) and the direction to up. A mode changes the segments
   only, and DOT changes bit 7 only; neither affects the counting.
 - The SPI side has its own clock, SCK, with no synchroniser to `clk`, so it
   works with a slow clock or a push button. Write the bases between clock
@@ -54,9 +54,16 @@ carry-out of the digit or its inverse. The display shows one digit at a time.
 | 0x01 | BASE32 | 7:4 base of digit 3, 3:0 base of digit 2 (0 means 16) |
 | 0x02 | MODE | 7:6 mode of digit 3, 5:4 digit 2, 3:2 digit 1, 1:0 digit 0 |
 | 0x03 | DOT | 7:6 dot of digit 3, 5:4 digit 2, 3:2 digit 1, 1:0 digit 0 |
+| 0x04 | CTRL | 2 DOWN (0 counts up, 1 counts down); 1:0 reserved, 7:3 unused |
 
 Display modes: 0 shows the digit, 1 shows it unless its own count is 0 (then
 all segments are off), 2 shows nothing, 3 shows a minus (segment G only).
+
+Counting down (CTRL bit 2 = 1): with EN = 1 each digit goes down by 1, and a
+digit at 0 wraps to the last digit of its base (F for base 16). A digit steps
+when the digit before it wraps, so 0000 goes to FFFF, and with bases 10, 6, 10,
+6 the clock goes from 00:00 to 59:59. CO is then the borrow: high while EN = 1
+and that digit and all the digits below it are 0. After reset it counts up.
 
 Dot values: 0 is off (bit 7 low), 1 is on (bit 7 high), 2 is CO, 3 is the
 inverse of CO. The reset value of DOT is 0xAA.

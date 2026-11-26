@@ -11,6 +11,7 @@ module digit (
     input  wire       rst_n,  // reset_n - low to reset
     input  wire       en,     // count enable (carry-in)
     input  wire [3:0] base,   // count base (use 0 for 16)
+    input  wire       down,   // direction: 0 counts up, 1 counts down
     output reg  [6:0] seg,    // segments, bits are {g,f,e,d,c,b,a}
     output wire       co,     // carry-out
     output wire       zero    // the count is 0
@@ -45,10 +46,15 @@ module digit (
   // The pattern shown after reset: the digit 0, taken from the table
   localparam [6:0] SEG_RESET = seg7(4'h0);
 
-  // What the counter will be after the next clock edge: one more when EN is 1
-  wire [3:0] next_count_raw = en ? count + 4'd1 : count;
+  // What the counter will be after the next clock edge. With EN = 0 it holds.
+  // Counting up it is one more, and the base itself becomes 0. Counting down
+  // it is one less, and below 0 it wraps to base - 1 (F when the base is 16).
+  // A count above the base just counts down into range.
+  wire [3:0] next_up_raw = count + 4'd1;
+  wire [3:0] next_up     = base == next_up_raw ? 4'd0 : next_up_raw;
+  wire [3:0] next_down   = zero ? base - 4'd1 : count - 4'd1;
 
-  wire [3:0] next_count = base == next_count_raw ? 4'd0 : next_count_raw;
+  wire [3:0] next_count = !en ? count : down ? next_down : next_up;
 
   // Segment pattern for that next digit (plain logic, no flip-flops)
   wire [6:0] next_seg = seg7(next_count);
@@ -65,10 +71,13 @@ module digit (
     end
   end
 
-  // Carry out: high when EN is 1 and the digit is F
-  assign co = en & (count + 4'd1 == base);
+  // Carry out, high only when EN is 1. Counting up it is high on the last
+  // digit of the base (F for base 16), so the next digit steps when this one
+  // wraps to 0. Counting down it is the borrow: high when the count is 0,
+  // so the next digit steps down when this one wraps to base - 1.
+  assign co = en & (down ? zero : count + 4'd1 == base);
 
-  // The count is 0 (used by display mode 1)
+  // The count is 0 (used by display mode 1 and by counting down)
   assign zero = count == 4'd0;
 
 endmodule
@@ -87,6 +96,7 @@ module settings (
     input  wire       rst_n,  // reset_n - low to reset
     output reg  [7:0] mode,   // display mode of each digit, 2 bits each, digit 0 in bits 1:0
     output reg  [7:0] dot,    // what bit 7 shows for each digit, 2 bits each, digit 0 in bits 1:0
+    output reg        down,   // count direction of all digits: 0 up, 1 down
     output reg  [3:0] base0,  // count base of digit 0 (0 means 16)
     output reg  [3:0] base1,  // count base of digit 1
     output reg  [3:0] base2,  // count base of digit 2
@@ -98,6 +108,7 @@ module settings (
   localparam [6:0] ADDR_BASE32 = 7'h01;  // {base3, base2}
   localparam [6:0] ADDR_MODE   = 7'h02;  // {mode3, mode2, mode1, mode0}
   localparam [6:0] ADDR_DOT    = 7'h03;  // {dot3, dot2, dot1, dot0}
+  localparam [6:0] ADDR_CTRL   = 7'h04;  // bit 2 is down; bits 1:0 are reserved, 7:3 unused
 
   // The bits received so far in this write, newest in bit 0
   reg [14:0] shift;
@@ -131,6 +142,7 @@ module settings (
     if (!rst_n) begin
       mode  <= 8'd0;
       dot   <= 8'hAA;  // the carry-out of every digit
+      down  <= 1'b0;   // count up
       base0 <= 4'd0;
       base1 <= 4'd0;
       base2 <= 4'd0;
@@ -141,6 +153,7 @@ module settings (
         ADDR_BASE32: {base3, base2} <= data;
         ADDR_MODE:   mode <= data;
         ADDR_DOT:    dot <= data;
+        ADDR_CTRL:   down <= data[2];
         default: ;
       endcase
     end
@@ -171,13 +184,14 @@ module tt_um_cyberhuman_7segment (
   wire mosi = uio_in[1];
   wire sck  = uio_in[3];
 
-  // Display mode, decimal point and counter base of each digit, set over SPI
-  // (after reset every digit is shown as is, the decimal point is the
-  // carry-out and all bases are 16)
+  // Display mode, decimal point and counter base of each digit, and the
+  // count direction, set over SPI (after reset every digit is shown as is,
+  // the decimal point is the carry-out, all bases are 16 and it counts up)
   wire [7:0] mode;
   wire [7:0] dot;
+  wire       down;
   wire [3:0] base0, base1, base2, base3;
-  settings settings0 (.sck, .cs_n, .mosi, .rst_n, .mode, .dot, .base0, .base1, .base2, .base3);
+  settings settings0 (.sck, .cs_n, .mosi, .rst_n, .mode, .dot, .down, .base0, .base1, .base2, .base3);
 
   // Segments and carry-out of each of the four digits
   wire [6:0] seg0, seg1, seg2, seg3;
@@ -187,11 +201,11 @@ module tt_um_cyberhuman_7segment (
   // Four digits in a chain, each with its own base (16 after reset, so
   // together a 16-bit counter 0000..FFFF; bases 10, 6, 10, 6 make a clock
   // 00:00..59:59). The lowest digit counts when EN is 1, each next digit
-  // counts when the digit before it has a carry-out.
-  digit digit0 (.clk, .rst_n, .en,      .base(base0), .seg(seg0), .co(co0), .zero(zero0));
-  digit digit1 (.clk, .rst_n, .en(co0), .base(base1), .seg(seg1), .co(co1), .zero(zero1));
-  digit digit2 (.clk, .rst_n, .en(co1), .base(base2), .seg(seg2), .co(co2), .zero(zero2));
-  digit digit3 (.clk, .rst_n, .en(co2), .base(base3), .seg(seg3), .co(co3), .zero(zero3));
+  // counts when the digit before it has a carry-out (counting down, a borrow).
+  digit digit0 (.clk, .rst_n, .en,      .base(base0), .down, .seg(seg0), .co(co0), .zero(zero0));
+  digit digit1 (.clk, .rst_n, .en(co0), .base(base1), .down, .seg(seg1), .co(co1), .zero(zero1));
+  digit digit2 (.clk, .rst_n, .en(co1), .base(base2), .down, .seg(seg2), .co(co2), .zero(zero2));
+  digit digit3 (.clk, .rst_n, .en(co2), .base(base3), .down, .seg(seg3), .co(co3), .zero(zero3));
 
   // What each digit shows, by its 2-bit display mode (the segments only, CO
   // is not affected): 0 = the digit as is, 1 = the digit unless its own
