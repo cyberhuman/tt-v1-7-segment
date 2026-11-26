@@ -18,9 +18,8 @@ and wraps to 0.
 - `uo[7]` is **CO**, the carry-out. It is high while EN = 1 and the digit shown
   is F. On the display it is the decimal point.
 - `rst_n` (active low) clears the counter, so the display shows 0.
-- The count is held in two rows of four flip-flops. The first row takes the next
-  value on the rising edge of `clk`. The second row copies it on the falling
-  edge and drives the display and CO, so the digit changes on the falling edge.
+- The count and the seven segment outputs are held in flip-flops, so all
+  segments change together on the rising edge of `clk`.
 
 | Pin | Name | Direction | Meaning |
 |-----|------|-----------|---------|
