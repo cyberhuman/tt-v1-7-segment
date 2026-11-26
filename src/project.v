@@ -103,6 +103,7 @@ module settings (
     output reg  [7:0] mode,   // display mode of each digit, 2 bits each, digit 0 in bits 1:0
     output reg  [7:0] dot,    // what bit 7 shows for each digit, 2 bits each, digit 0 in bits 1:0
     output reg        down,   // count direction of all digits: 0 up, 1 down
+    output reg  [1:0] count_mode,  // what clocks the counter: 0 is clk, 1 to 3 is INC
     output reg  [7:0] count10,  // held count of digits 1 and 0 (digit 1 in bits 7:4)
     output reg  [7:0] count32,  // held count of digits 3 and 2 (digit 3 in bits 7:4)
     output reg        tgl10,  // flips on every write to COUNT10
@@ -118,7 +119,7 @@ module settings (
   localparam [6:0] ADDR_BASE32 = 7'h01;  // {base3, base2}
   localparam [6:0] ADDR_MODE   = 7'h02;  // {mode3, mode2, mode1, mode0}
   localparam [6:0] ADDR_DOT    = 7'h03;  // {dot3, dot2, dot1, dot0}
-  localparam [6:0] ADDR_CTRL   = 7'h04;  // bit 2 is down; bits 1:0 are reserved, 7:3 unused
+  localparam [6:0] ADDR_CTRL   = 7'h04;  // bits 1:0 are the count mode, bit 2 is down, 7:3 unused
   localparam [6:0] ADDR_COUNT10 = 7'h05;  // {count1, count0}, loaded on the next clock edge
   localparam [6:0] ADDR_COUNT32 = 7'h06;  // {count3, count2}, loaded on the next clock edge
 
@@ -155,6 +156,7 @@ module settings (
       mode  <= 8'd0;
       dot   <= 8'hAA;  // the carry-out of every digit
       down  <= 1'b0;   // count up
+      count_mode <= 2'd0;  // clk counts
       count10 <= 8'd0;
       count32 <= 8'd0;
       tgl10 <= 1'b0;
@@ -169,7 +171,7 @@ module settings (
         ADDR_BASE32: {base3, base2} <= data;
         ADDR_MODE:   mode <= data;
         ADDR_DOT:    dot <= data;
-        ADDR_CTRL:   down <= data[2];
+        ADDR_CTRL:   begin count_mode <= data[1:0]; down <= data[2]; end
         // A count is held with a toggle bit that flips on every write, so
         // writing the same value again loads again. The clk side sees the flip.
         ADDR_COUNT10: begin count10 <= data; tgl10 <= ~tgl10; end
@@ -211,19 +213,27 @@ module tt_um_cyberhuman_7segment (
   wire [7:0] mode;
   wire [7:0] dot;
   wire       down;
+  wire [1:0] count_mode;
   wire [3:0] base0, base1, base2, base3;
   wire [7:0] count10, count32;
   wire       tgl10, tgl32;
-  settings settings0 (.sck, .cs_n, .mosi, .rst_n, .mode, .dot, .down, .count10, .count32,
+  settings settings0 (.sck, .cs_n, .mosi, .rst_n, .mode, .dot, .down, .count_mode, .count10, .count32,
                       .tgl10, .tgl32, .base0, .base1, .base2, .base3);
 
+  // INC is the counter clock in the modes 1 to 3, it comes from input pin 1
+  wire inc = ui_in[1];
+
+  // The counter clock: clk in mode 0, INC in the other modes. This is a plain
+  // switch, not glitch-free: a write to the mode may give one edge on it.
+  wire count_clk = (count_mode == 2'd0) ? clk : inc;
+
   // Loading a count: each write to COUNT10 or COUNT32 flips a toggle bit on
-  // the SCK side. Here a copy of each toggle bit is kept on clk. When the two
-  // differ, the two digits of that register load the held count on this clock
-  // edge instead of counting, and the copy catches up. The toggle bits cross
+  // the SCK side. Here a copy of each toggle bit is kept on the counter clock. When the two
+  // differ, the two digits of that register load the held count on this counter
+  // clock edge instead of counting, and the copy catches up. The toggle bits cross
   // from SCK to clk without a synchroniser, like the other settings.
   reg cp10, cp32;
-  always @(posedge clk or negedge rst_n) begin
+  always @(posedge count_clk or negedge rst_n) begin
     if (!rst_n) begin
       cp10 <= 1'b0;
       cp32 <= 1'b0;
@@ -244,10 +254,10 @@ module tt_um_cyberhuman_7segment (
   // together a 16-bit counter 0000..FFFF; bases 10, 6, 10, 6 make a clock
   // 00:00..59:59). The lowest digit counts when EN is 1, each next digit
   // counts when the digit before it has a carry-out (counting down, a borrow).
-  digit digit0 (.clk, .rst_n, .en,      .base(base0), .down, .load(load10), .value(count10[3:0]), .seg(seg0), .co(co0), .zero(zero0));
-  digit digit1 (.clk, .rst_n, .en(co0), .base(base1), .down, .load(load10), .value(count10[7:4]), .seg(seg1), .co(co1), .zero(zero1));
-  digit digit2 (.clk, .rst_n, .en(co1), .base(base2), .down, .load(load32), .value(count32[3:0]), .seg(seg2), .co(co2), .zero(zero2));
-  digit digit3 (.clk, .rst_n, .en(co2), .base(base3), .down, .load(load32), .value(count32[7:4]), .seg(seg3), .co(co3), .zero(zero3));
+  digit digit0 (.clk(count_clk), .rst_n, .en,      .base(base0), .down, .load(load10), .value(count10[3:0]), .seg(seg0), .co(co0), .zero(zero0));
+  digit digit1 (.clk(count_clk), .rst_n, .en(co0), .base(base1), .down, .load(load10), .value(count10[7:4]), .seg(seg1), .co(co1), .zero(zero1));
+  digit digit2 (.clk(count_clk), .rst_n, .en(co1), .base(base2), .down, .load(load32), .value(count32[3:0]), .seg(seg2), .co(co2), .zero(zero2));
+  digit digit3 (.clk(count_clk), .rst_n, .en(co2), .base(base3), .down, .load(load32), .value(count32[7:4]), .seg(seg3), .co(co3), .zero(zero3));
 
   // What each digit shows, by its 2-bit display mode (the segments only, CO
   // is not affected): 0 = the digit as is, 1 = the digit unless its own
@@ -296,6 +306,6 @@ module tt_um_cyberhuman_7segment (
   assign uio_oe  = 0;
 
   // List all unused inputs to prevent warnings
-  wire _unused = &{ena, uio_in[7:6], uio_in[2], ui_in[7:1], 1'b0};
+  wire _unused = &{ena, uio_in[7:6], uio_in[2], ui_in[7:2], 1'b0};
 
 endmodule

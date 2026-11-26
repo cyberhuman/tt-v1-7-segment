@@ -20,8 +20,11 @@ nothing, or show a minus. The decimal point of each digit can be off, on, the
 carry-out of the digit or its inverse. The display shows one digit at a time.
 
 - `ui[0]` is **EN**, the count enable (carry-in of the lowest digit). With
-  EN = 1 the counter adds 1 on each clock cycle. With EN = 0 it holds its
-  value.
+  EN = 1 the counter adds 1 on each counter clock edge. With EN = 0 it holds
+  its value. EN works in every count mode.
+- `ui[1]` is **INC**, the counter clock in the count modes 1 to 3. The counter
+  steps on each rising edge of INC, and `clk` does not count then. In mode 0
+  INC is ignored.
 - `uio[4]` and `uio[5]` are **SEL0** and **SEL1**: they pick the digit shown,
   0 = lowest, 3 = highest. A change shows at once, without a clock edge.
 - `uo[0]` to `uo[6]` drive the segments A to G (active high) of the digit shown.
@@ -40,13 +43,13 @@ carry-out of the digit or its inverse. The display shows one digit at a time.
   no MISO yet.
 - `rst_n` (active low) clears the counter, so all four digits are 0, sets all
   four bases to 16, all display modes to 0 (every digit is shown as is) and
-  all DOT values to 2 (the decimal point is CO) and the direction to up. A mode changes the segments
+  all DOT values to 2 (the decimal point is CO) the direction to up and the count mode to 0. A display mode changes the segments
   only, and DOT changes bit 7 only; neither affects the counting.
 - The SPI side has its own clock, SCK, with no synchroniser to `clk`, so it
   works with a slow clock or a push button. Write the bases between clock
   edges, not at the moment of one.
 - The counts and the segment outputs are held in flip-flops, so all segments
-  change together on the rising edge of `clk`.
+  change together on the rising edge of the counter clock.
 
 | Address | Register | Data bits |
 |---------|----------|-----------|
@@ -54,7 +57,7 @@ carry-out of the digit or its inverse. The display shows one digit at a time.
 | 0x01 | BASE32 | 7:4 base of digit 3, 3:0 base of digit 2 (0 means 16) |
 | 0x02 | MODE | 7:6 mode of digit 3, 5:4 digit 2, 3:2 digit 1, 1:0 digit 0 |
 | 0x03 | DOT | 7:6 dot of digit 3, 5:4 digit 2, 3:2 digit 1, 1:0 digit 0 |
-| 0x04 | CTRL | 2 DOWN (0 counts up, 1 counts down); 1:0 reserved, 7:3 unused |
+| 0x04 | CTRL | 2 DOWN (0 counts up, 1 counts down); 1:0 count mode; 7:3 unused |
 | 0x05 | COUNT10 | 7:4 count of digit 1, 3:0 count of digit 0 |
 | 0x06 | COUNT32 | 7:4 count of digit 3, 3:0 count of digit 2 |
 
@@ -67,8 +70,15 @@ when the digit before it wraps, so 0000 goes to FFFF, and with bases 10, 6, 10,
 6 the clock goes from 00:00 to 59:59. CO is then the borrow: high while EN = 1
 and that digit and all the digits below it are 0. After reset it counts up.
 
+Count mode (CTRL bits 1:0): in mode 0 the counter is clocked by `clk`, as
+before, and INC is ignored. In modes 1, 2 and 3 it is clocked by INC (`ui[1]`)
+and `clk` does not count. For now modes 2 and 3 are the same as mode 1. The
+count mode is not glitch-free: a write to it may make one edge on the counter
+clock, which can count or load once. So set the mode first, with `clk` and INC
+low, and then the count.
+
 Setting the count: a write to COUNT10 or COUNT32 is taken on the next rising
-edge of `clk`, which loads those two digits instead of counting, whatever EN
+edge of the counter clock (`clk` in mode 0, INC in the other modes), which loads those two digits instead of counting, whatever EN
 and the direction are. Writing the same value again loads again, and writing
 both registers before one edge loads all four digits on that edge. A digit that
 loads has no carry-out on that edge, and a value at or above the base is taken
@@ -80,6 +90,7 @@ inverse of CO. The reset value of DOT is 0xAA.
 | Pin | Name | Direction | Meaning |
 |-----|------|-----------|---------|
 | ui[0] | EN | in | count enable (carry-in) |
+| ui[1] | INC | in | counter clock in the count modes 1 to 3 |
 | uio[0] | CS | in | SPI chip select, active low |
 | uio[1] | MOSI | in | SPI data in |
 | uio[3] | SCK | in | SPI clock |

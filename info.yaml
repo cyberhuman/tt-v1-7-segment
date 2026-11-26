@@ -18,7 +18,7 @@ project:
 pinout:
   # Inputs
   ui[0]: "EN"
-  ui[1]: ""
+  ui[1]: "INC"
   ui[2]: ""
   ui[3]: ""
   ui[4]: ""
