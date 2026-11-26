@@ -10,22 +10,53 @@ PATTERNS = [0x3F, 0x06, 0x5B, 0x4F, 0x66, 0x6D, 0x7D, 0x07,
             0x7F, 0x6F, 0x77, 0x7C, 0x39, 0x5E, 0x79, 0x71]
 
 
-def ui(en, sel, base=0):
-    # ui_in bit 0 is EN, bits 2:1 are SEL, bits 6:3 are the count base
-    return en | (sel << 1) | (base << 3)
+def ui(en, sel):
+    # ui_in bit 0 is EN, bits 2:1 are SEL. The base is written over SPI.
+    return en | (sel << 1)
 
 
-async def start(dut, en, sel=0, base=0):
+# SPI pins on uio_in: bit 0 CS (active low), bit 1 MOSI, bit 3 SCK
+CS, MOSI, SCK = 0x01, 0x02, 0x08
+SPI_HALF = 100  # ns, half of one SCK period
+
+
+async def spi_write(dut, value, bits=8):
+    # Bit-bang one SPI frame, mode 0, MSB first, CS idle high. MOSI changes
+    # while SCK is low and is sampled on the rising edge. Fewer bits than 8
+    # make a cut-short frame. The whole write takes 1.6 us, well inside half
+    # a clock cycle (5 us), so it fits between clock edges.
+    dut.uio_in.value = 0            # CS low, SCK low
+    await Timer(SPI_HALF, unit="ns")
+    for i in range(bits):
+        bit = (value >> (7 - i)) & 1
+        dut.uio_in.value = bit * MOSI
+        await Timer(SPI_HALF, unit="ns")
+        dut.uio_in.value = bit * MOSI | SCK
+        await Timer(SPI_HALF, unit="ns")
+        dut.uio_in.value = bit * MOSI
+    await Timer(SPI_HALF, unit="ns")
+    dut.uio_in.value = CS           # CS back high
+    await Timer(SPI_HALF, unit="ns")
+
+
+async def start(dut, en, sel=0, base=None):
     # Start the clock, hold reset for a few cycles, then release it
     cocotb.start_soon(Clock(dut.clk, 10, unit="us").start())
     dut.ena.value = 1
-    dut.ui_in.value = ui(en, sel, base)
-    dut.uio_in.value = 0
+    dut.ui_in.value = ui(en, sel)
+    dut.uio_in.value = CS
     dut.rst_n.value = 0
     await ClockCycles(dut.clk, 5)
     dut.rst_n.value = 1
     # Look at the outputs on the falling edge, away from the rising edge
     await FallingEdge(dut.clk)
+    # Reset clears the base, so it is written after reset. EN is held at 0
+    # during the write and one clock cycle, so the count stays at 0.
+    if base is not None:
+        dut.ui_in.value = ui(0, sel)
+        await spi_write(dut, base)
+        await FallingEdge(dut.clk)
+        dut.ui_in.value = ui(en, sel)
 
 
 def shown(digit, co=0):
@@ -33,11 +64,11 @@ def shown(digit, co=0):
     return PATTERNS[digit] | (0x80 if co else 0)
 
 
-async def read_digits(dut, en=1, base=0):
+async def read_digits(dut, en=1):
     # Read all four digits (lowest first) by switching SEL, no clock edge needed
     values = []
     for sel in range(4):
-        dut.ui_in.value = ui(en, sel, base)
+        dut.ui_in.value = ui(en, sel)
         await Timer(1, unit="us")
         values.append(int(dut.uo_out.value) & 0x7F)
     return values
@@ -158,10 +189,10 @@ async def test_base10_count_100(dut):
     await start(dut, 1, base=10)
     # Each step the decimal value is one more, digit1 steps when digit0 wraps
     for n in range(105):
-        values = await read_digits(dut, base=10)
+        values = await read_digits(dut)
         expected = [(n // 10 ** d) % 10 for d in range(4)]
         assert values == [PATTERNS[e] for e in expected], f"count {n}"
-        dut.ui_in.value = ui(1, 0, 10)
+        dut.ui_in.value = ui(1, 0)
         await FallingEdge(dut.clk)
     # 105 reached: digit2 stepped once when 99 went to 100
 
@@ -171,10 +202,10 @@ async def test_base3(dut):
     await start(dut, 1, base=3)
     # Digit0 cycles 0, 1, 2, CO only at 2; the carry reaches digit1 after 3 clocks
     for n in range(10):
-        values = await read_digits(dut, base=3)
+        values = await read_digits(dut)
         expected = [(n // 3 ** d) % 3 for d in range(4)]
         assert values == [PATTERNS[e] for e in expected], f"count {n}"
-        dut.ui_in.value = ui(1, 0, 3)
+        dut.ui_in.value = ui(1, 0)
         await Timer(1, unit="us")
         assert dut.uo_out.value == shown(n % 3, n % 3 == 2), f"co at {n}"
         await FallingEdge(dut.clk)
@@ -186,10 +217,82 @@ async def test_base_en_holds(dut):
     # Count to 17, then EN = 0 with base 10 holds all digits
     for _ in range(17):
         await FallingEdge(dut.clk)
-    before = await read_digits(dut, en=0, base=10)
+    before = await read_digits(dut, en=0)
     assert before == [PATTERNS[7], PATTERNS[1], PATTERNS[0], PATTERNS[0]]
     await ClockCycles(dut.clk, 25)
-    assert await read_digits(dut, en=0, base=10) == before
-    dut.ui_in.value = ui(0, 0, 10)
+    assert await read_digits(dut, en=0) == before
+    dut.ui_in.value = ui(0, 0)
     await Timer(1, unit="us")
     assert dut.uo_out.value == PATTERNS[7], "CO low with EN = 0"
+
+
+async def read_base(dut):
+    # Count with EN = 1 until the lowest digit wraps to 0 and return the
+    # digit before it: base - 1 (15 when the base is 16)
+    dut.ui_in.value = ui(1, 0)
+    last = None
+    for _ in range(17):
+        await FallingEdge(dut.clk)
+        value = int(dut.uo_out.value) & 0x7F
+        if value == PATTERNS[0]:
+            return PATTERNS.index(last)
+        last = value
+    return 15
+
+
+@cocotb.test()
+async def test_base_default_16(dut):
+    await start(dut, 1)
+    # No write after reset: the base is 16, the lowest digit counts to F
+    assert await read_base(dut) == 15
+
+
+@cocotb.test()
+async def test_spi_short_frame_ignored(dut):
+    await start(dut, 1, base=10)
+    await spi_write(dut, 0x03, bits=7)   # cut short
+    await spi_write(dut, 0x00, bits=3)
+    assert await read_base(dut) == 9
+
+
+@cocotb.test()
+async def test_spi_cs_high_ignored(dut):
+    await start(dut, 1, base=10)
+    # SCK edges with CS high: eight clocks carrying 0x03, nothing happens
+    for _ in range(8):
+        dut.uio_in.value = CS | MOSI | SCK
+        await Timer(SPI_HALF, unit="ns")
+        dut.uio_in.value = CS | MOSI
+        await Timer(SPI_HALF, unit="ns")
+    assert await read_base(dut) == 9
+
+
+@cocotb.test()
+async def test_spi_two_frames_second_wins(dut):
+    await start(dut, 1)
+    # Two frames in one CS-low period: 16 SCK edges, the second frame wins.
+    # The upper 4 bits of a frame are ignored (0xA3 is base 3).
+    dut.uio_in.value = 0
+    await Timer(SPI_HALF, unit="ns")
+    for value in (0x0A, 0xA3):
+        for i in range(8):
+            bit = (value >> (7 - i)) & 1
+            dut.uio_in.value = bit * MOSI
+            await Timer(SPI_HALF, unit="ns")
+            dut.uio_in.value = bit * MOSI | SCK
+            await Timer(SPI_HALF, unit="ns")
+            dut.uio_in.value = bit * MOSI
+    dut.uio_in.value = CS
+    await Timer(SPI_HALF, unit="ns")
+    assert await read_base(dut) == 2
+
+
+@cocotb.test()
+async def test_reset_returns_base_16(dut):
+    await start(dut, 1, base=10)
+    assert await read_base(dut) == 9
+    dut.rst_n.value = 0
+    await ClockCycles(dut.clk, 3)
+    dut.rst_n.value = 1
+    await FallingEdge(dut.clk)
+    assert await read_base(dut) == 15

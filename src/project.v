@@ -69,6 +69,47 @@ module digit (
 
 endmodule
 
+// The settings register: written over SPI (mode 0, MSB first), one frame is
+// 8 bits. On the 8th rising SCK edge the low 4 bits of the frame become the
+// count base, the upper 4 bits are ignored. A frame cut short by CS going high
+// changes nothing. Everything here is clocked by SCK, not by clk.
+module settings (
+    input  wire       sck,    // SPI clock
+    input  wire       cs_n,   // SPI chip select, low while a frame is sent
+    input  wire       mosi,   // SPI data in
+    input  wire       rst_n,  // reset_n - low to reset
+    output reg  [3:0] base    // count base (0 means 16)
+);
+
+  // The bits received so far in this frame, newest in bit 0
+  reg [6:0] shift;
+
+  // How many bits of this frame have been received (0..7)
+  reg [2:0] bit_count;
+
+  // The frame is complete when the 8th bit arrives: 7 bits are already in
+  // the shift register, and the bit on MOSI is the last one.
+  // The counter is held at 0 while CS is high, so a cut-short frame is dropped.
+  always @(posedge sck or posedge cs_n) begin
+    if (cs_n) begin
+      bit_count <= 3'd0;
+    end else begin
+      bit_count <= bit_count + 3'd1;
+      shift     <= {shift[5:0], mosi};
+    end
+  end
+
+  // The base takes the low 4 bits of the frame, they are the last 4 bits sent
+  always @(posedge sck or negedge rst_n) begin
+    if (!rst_n) begin
+      base <= 4'd0;
+    end else if (!cs_n && bit_count == 3'd7) begin
+      base <= {shift[2:0], mosi};
+    end
+  end
+
+endmodule
+
 module tt_um_cyberhuman_7segment (
     input  wire [7:0] ui_in,    // Dedicated inputs
     output wire [7:0] uo_out,   // Dedicated outputs
@@ -86,8 +127,15 @@ module tt_um_cyberhuman_7segment (
   // SEL picks which digit is shown: 0 = lowest digit, 3 = highest digit
   wire [1:0] sel = ui_in[2:1];
 
-  // counter base, all digits
-  wire [3:0] base = ui_in[6:3];
+  // SPI pins: uio[0] is CS (active low), uio[1] is MOSI, uio[3] is SCK.
+  // uio[2] is kept for MISO, it is not driven.
+  wire cs_n = uio_in[0];
+  wire mosi = uio_in[1];
+  wire sck  = uio_in[3];
+
+  // Counter base for all digits, set over SPI (16 after reset)
+  wire [3:0] base;
+  settings settings0 (.sck, .cs_n, .mosi, .rst_n, .base);
 
   // Segments and carry-out of each of the four digits
   wire [6:0] seg0, seg1, seg2, seg3;
@@ -119,6 +167,6 @@ module tt_um_cyberhuman_7segment (
   assign uio_oe  = 0;
 
   // List all unused inputs to prevent warnings
-  wire _unused = &{ena, uio_in, ui_in[7], 1'b0};
+  wire _unused = &{ena, uio_in[7:4], uio_in[2], ui_in[7:3], 1'b0};
 
 endmodule
