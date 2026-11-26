@@ -195,8 +195,9 @@ module tt_um_cyberhuman_7segment (
   // EN is the count enable, it comes from input pin 0
   wire en = ui_in[0];
 
-  // SEL picks which digit is shown: 0 = lowest digit, 3 = highest digit
-  wire [1:0] sel = ui_in[2:1];
+  // SEL picks which digit is shown: 0 = lowest digit, 3 = highest digit.
+  // It comes from bidirectional pins uio[4] (SEL0) and uio[5] (SEL1), used as inputs.
+  wire [1:0] sel = uio_in[5:4];
 
   // SPI pins: uio[0] is CS (active low), uio[1] is MOSI, uio[3] is SCK.
   // uio[2] is kept for MISO, it is not driven.
@@ -295,6 +296,6 @@ module tt_um_cyberhuman_7segment (
   assign uio_oe  = 0;
 
   // List all unused inputs to prevent warnings
-  wire _unused = &{ena, uio_in[7:4], uio_in[2], ui_in[7:3], 1'b0};
+  wire _unused = &{ena, uio_in[7:6], uio_in[2], ui_in[7:1], 1'b0};
 
 endmodule

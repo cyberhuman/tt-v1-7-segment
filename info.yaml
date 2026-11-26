@@ -18,8 +18,8 @@ project:
 pinout:
   # Inputs
   ui[0]: "EN"
-  ui[1]: "SEL0"
-  ui[2]: "SEL1"
+  ui[1]: ""
+  ui[2]: ""
   ui[3]: ""
   ui[4]: ""
   ui[5]: ""
@@ -41,8 +41,8 @@ pinout:
   uio[1]: "MOSI"
   uio[2]: ""
   uio[3]: "SCK"
-  uio[4]: ""
-  uio[5]: ""
+  uio[4]: "SEL0"
+  uio[5]: "SEL1"
   uio[6]: ""
   uio[7]: ""
 

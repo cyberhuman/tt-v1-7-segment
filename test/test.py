@@ -11,13 +11,36 @@ PATTERNS = [0x3F, 0x06, 0x5B, 0x4F, 0x66, 0x6D, 0x7D, 0x07,
             0x7F, 0x6F, 0x77, 0x7C, 0x39, 0x5E, 0x79, 0x71]
 
 
-def ui(en, sel):
-    # ui_in bit 0 is EN, bits 2:1 are SEL. The base is written over SPI.
-    return en | (sel << 1)
-
-
-# SPI pins on uio_in: bit 0 CS (active low), bit 1 MOSI, bit 3 SCK
+# SPI pins on uio_in: bit 0 CS (active low), bit 1 MOSI, bit 3 SCK.
+# SEL is on uio_in bits 5:4 (SEL0 on bit 4). The base is written over SPI.
 CS, MOSI, SCK = 0x01, 0x02, 0x08
+SEL_SHIFT = 4
+
+# The SEL value now on the pins. Every write to uio_in goes through uio_set,
+# which adds it, so an SPI write never disturbs SEL and a SEL change never
+# disturbs the SPI lines.
+sel_now = 0
+spi_now = CS  # the SPI lines now on the pins
+
+
+def uio_set(dut, spi):
+    # Drive uio_in: the SPI lines in bits 3:0 and SEL in bits 5:4
+    global spi_now
+    spi_now = spi
+    dut.uio_in.value = spi | (sel_now << SEL_SHIFT)
+
+
+def set_sel(dut, sel):
+    # Change SEL only, the SPI lines keep their level
+    global sel_now
+    sel_now = sel
+    uio_set(dut, spi_now)
+
+
+def drive(dut, en, sel):
+    # ui_in bit 0 is EN; SEL goes to uio_in bits 5:4
+    dut.ui_in.value = en
+    set_sel(dut, sel)
 SPI_HALF = 100  # ns, half of one SCK period
 
 
@@ -38,24 +61,24 @@ async def spi_clock_bits(dut, value, bits):
     # rising edge.
     for i in range(bits):
         bit = (value >> (15 - i)) & 1
-        dut.uio_in.value = bit * MOSI
+        uio_set(dut, bit * MOSI)
         await Timer(SPI_HALF, unit="ns")
-        dut.uio_in.value = bit * MOSI | SCK
+        uio_set(dut, bit * MOSI | SCK)
         await Timer(SPI_HALF, unit="ns")
-        dut.uio_in.value = bit * MOSI
+        uio_set(dut, bit * MOSI)
 
 
 async def spi_writes(dut, *writes, bits=16):
     # Several (address, value) writes in one CS-low period, CS idle high.
     # `bits` below 16 cuts the last write short (its first bits are sent).
     # One write takes 3.2 us, so a few fit between clock edges (5 us).
-    dut.uio_in.value = 0            # CS low, SCK low
+    uio_set(dut, 0)                # CS low, SCK low
     await Timer(SPI_HALF, unit="ns")
     for n, (address, value) in enumerate(writes):
         last = n == len(writes) - 1
         await spi_clock_bits(dut, address << 8 | value, bits if last else 16)
     await Timer(SPI_HALF, unit="ns")
-    dut.uio_in.value = CS           # CS back high
+    uio_set(dut, CS)              # CS back high
     await Timer(SPI_HALF, unit="ns")
 
 
@@ -87,8 +110,8 @@ async def start(dut, en, sel=0, base=None, mode=0, dot=DOT_RESET, ctrl=0):
     # with the bases.
     cocotb.start_soon(Clock(dut.clk, 10, unit="us").start())
     dut.ena.value = 1
-    dut.ui_in.value = ui(en, sel)
-    dut.uio_in.value = CS
+    drive(dut, en, sel)
+    uio_set(dut, CS)
     dut.rst_n.value = 0
     await ClockCycles(dut.clk, 5)
     dut.rst_n.value = 1
@@ -97,10 +120,10 @@ async def start(dut, en, sel=0, base=None, mode=0, dot=DOT_RESET, ctrl=0):
     # Reset clears the registers, so they are written after reset. EN is held
     # at 0 during the write and one clock cycle, so the count stays at 0.
     if base is not None or mode or dot != DOT_RESET or ctrl:
-        dut.ui_in.value = ui(0, sel)
+        drive(dut, 0, sel)
         await write_settings(dut, 0 if base is None else base, mode, dot, ctrl)
         await FallingEdge(dut.clk)
-        dut.ui_in.value = ui(en, sel)
+        drive(dut, en, sel)
 
 
 def shown(digit, co=0):
@@ -112,7 +135,7 @@ async def read_digits(dut, en=1):
     # Read all four digits (lowest first) by switching SEL, no clock edge needed
     values = []
     for sel in range(4):
-        dut.ui_in.value = ui(en, sel)
+        drive(dut, en, sel)
         await Timer(1, unit="us")
         values.append(int(dut.uo_out.value) & 0x7F)
     return values
@@ -123,7 +146,7 @@ async def test_reset(dut):
     await start(dut, 1)
     # Reset shows digit 0 on all four digits and CO is low
     for sel in range(4):
-        dut.ui_in.value = ui(1, sel)
+        drive(dut, 1, sel)
         await Timer(1, unit="us")
         assert dut.uo_out.value == PATTERNS[0], f"digit {sel}"
 
@@ -144,12 +167,12 @@ async def test_hold(dut):
     # Count to each digit, then stop with EN = 0: value holds and CO is 0
     for digit in range(16):
         assert dut.uo_out.value == shown(digit, digit == 15)
-        dut.ui_in.value = ui(0, 0)
+        drive(dut, 0, 0)
         await FallingEdge(dut.clk)
         for _ in range(4):
             assert dut.uo_out.value == PATTERNS[digit], f"hold at {digit}"
             await FallingEdge(dut.clk)
-        dut.ui_in.value = ui(1, 0)
+        drive(dut, 1, 0)
         await FallingEdge(dut.clk)
 
 
@@ -159,11 +182,11 @@ async def test_sel_no_clock(dut):
     # Count to 0x0035, then stop the clock edges from mattering: EN = 0
     for _ in range(0x35):
         await FallingEdge(dut.clk)
-    dut.ui_in.value = ui(0, 0)
+    drive(dut, 0, 0)
     await FallingEdge(dut.clk)
     # Changing SEL changes the display at once, within the same clock phase
     for sel, digit in [(0, 5), (1, 3), (2, 0), (3, 0), (1, 3), (0, 5)]:
-        dut.ui_in.value = ui(0, sel)
+        drive(dut, 0, sel)
         await Timer(1, unit="us")
         assert dut.uo_out.value == PATTERNS[digit], f"sel {sel}"
 
@@ -177,7 +200,7 @@ async def test_carry_chain(dut):
         values = await read_digits(dut)
         expected = [(n >> (4 * d)) & 0xF for d in range(4)]
         assert values == [PATTERNS[e] for e in expected], f"count {n:04X}"
-        dut.ui_in.value = ui(1, 0)
+        drive(dut, 1, 0)
         await FallingEdge(dut.clk)
     # 0x0120 reached: digit2 stepped once when 0x00FF went to 0x0100
 
@@ -187,7 +210,7 @@ async def test_en_holds_all(dut):
     await start(dut, 1)
     for _ in range(0x1F):
         await FallingEdge(dut.clk)
-    dut.ui_in.value = ui(0, 0)
+    drive(dut, 0, 0)
     await FallingEdge(dut.clk)
     before = await read_digits(dut, en=0)
     assert before == [PATTERNS[0xF], PATTERNS[1], PATTERNS[0], PATTERNS[0]]
@@ -202,18 +225,18 @@ async def test_co_of_shown_digit(dut):
     for _ in range(0xEF):
         await FallingEdge(dut.clk)
     for sel, digit, co in [(0, 0xF, 1), (1, 0xE, 0), (2, 0, 0), (3, 0, 0)]:
-        dut.ui_in.value = ui(1, sel)
+        drive(dut, 1, sel)
         await Timer(1, unit="us")
         assert dut.uo_out.value == shown(digit, co), f"sel {sel}"
     # Step to 0x00FF: now digit1 has CO too, digit2 and digit3 do not
     for _ in range(0x10):
         await FallingEdge(dut.clk)
     for sel, digit, co in [(0, 0xF, 1), (1, 0xF, 1), (2, 0, 0), (3, 0, 0)]:
-        dut.ui_in.value = ui(1, sel)
+        drive(dut, 1, sel)
         await Timer(1, unit="us")
         assert dut.uo_out.value == shown(digit, co), f"sel {sel}"
     # With EN = 0 all CO are low
-    dut.ui_in.value = ui(0, 1)
+    drive(dut, 0, 1)
     await Timer(1, unit="us")
     assert dut.uo_out.value == PATTERNS[0xF]
 
@@ -236,7 +259,7 @@ async def test_base10_count_100(dut):
         values = await read_digits(dut)
         expected = [(n // 10 ** d) % 10 for d in range(4)]
         assert values == [PATTERNS[e] for e in expected], f"count {n}"
-        dut.ui_in.value = ui(1, 0)
+        drive(dut, 1, 0)
         await FallingEdge(dut.clk)
     # 105 reached: digit2 stepped once when 99 went to 100
 
@@ -249,7 +272,7 @@ async def test_base3(dut):
         values = await read_digits(dut)
         expected = [(n // 3 ** d) % 3 for d in range(4)]
         assert values == [PATTERNS[e] for e in expected], f"count {n}"
-        dut.ui_in.value = ui(1, 0)
+        drive(dut, 1, 0)
         await Timer(1, unit="us")
         assert dut.uo_out.value == shown(n % 3, n % 3 == 2), f"co at {n}"
         await FallingEdge(dut.clk)
@@ -265,7 +288,7 @@ async def test_base_en_holds(dut):
     assert before == [PATTERNS[7], PATTERNS[1], PATTERNS[0], PATTERNS[0]]
     await ClockCycles(dut.clk, 25)
     assert await read_digits(dut, en=0) == before
-    dut.ui_in.value = ui(0, 0)
+    drive(dut, 0, 0)
     await Timer(1, unit="us")
     assert dut.uo_out.value == PATTERNS[7], "CO low with EN = 0"
 
@@ -273,7 +296,7 @@ async def test_base_en_holds(dut):
 async def read_base(dut):
     # Count with EN = 1 until the lowest digit wraps to 0 and return the
     # digit before it: base - 1 (15 when the base is 16)
-    dut.ui_in.value = ui(1, 0)
+    drive(dut, 1, 0)
     last = None
     for _ in range(17):
         await FallingEdge(dut.clk)
@@ -306,7 +329,7 @@ async def read_settings(dut, clocks=400):
             seen[d].add(v)
             if v in PATTERNS:
                 highest[d] = max(highest[d], PATTERNS.index(v))
-        dut.ui_in.value = ui(1, 0)
+        drive(dut, 1, 0)
         await FallingEdge(dut.clk)
     bases, mode = [], 0
     for d in range(4):
@@ -423,9 +446,9 @@ async def test_spi_cs_high_ignored(dut):
     for value in (BASE10 << 8 | 0x43, MODE << 8 | 0x0F):
         for i in range(16):
             bit = (value >> (15 - i)) & 1
-            dut.uio_in.value = CS | bit * MOSI | SCK
+            uio_set(dut, CS | bit * MOSI | SCK)
             await Timer(SPI_HALF, unit="ns")
-            dut.uio_in.value = CS | bit * MOSI
+            uio_set(dut, CS | bit * MOSI)
             await Timer(SPI_HALF, unit="ns")
     assert await read_settings(dut) == PRESET
 
@@ -439,21 +462,21 @@ async def test_clock_10_6_10_6(dut):
         m = n % 3600
         expected = [m % 10, m // 10 % 6, m // 60 % 10, m // 600 % 6]
         assert values == [PATTERNS[e] for e in expected], f"count {n}"
-        dut.ui_in.value = ui(1, 0)
+        drive(dut, 1, 0)
         await FallingEdge(dut.clk)
     # Seconds just rolled: 59 -> 1:00 was passed at n = 59 -> 60 above
 
 
 async def step(dut, n=1):
     # n clock cycles with EN = 1
-    dut.ui_in.value = ui(1, 0)
+    drive(dut, 1, 0)
     for _ in range(n):
         await FallingEdge(dut.clk)
 
 
 async def lit(dut, sel):
     # uo_out[6:0] of one digit
-    dut.ui_in.value = ui(1, sel)
+    drive(dut, 1, sel)
     await Timer(1, unit="us")
     return int(dut.uo_out.value) & 0x7F
 
@@ -520,7 +543,7 @@ async def test_co_same_in_all_modes(dut):
     for m in range(4):
         await start(dut, 1, base=[1, 10, 10, 10], mode=m * 0x55)
         for en, co in ((1, 0x80), (0, 0)):
-            dut.ui_in.value = ui(en, 0)
+            drive(dut, en, 0)
             await Timer(1, unit="us")
             assert int(dut.uo_out.value) & 0x80 == co, f"mode {m} en {en}"
         dut.rst_n.value = 0
@@ -558,7 +581,7 @@ async def test_reset_clears_registers(dut):
 
 async def dp(dut, sel):
     # uo_out[7] of one digit
-    dut.ui_in.value = ui(1, sel)
+    drive(dut, 1, sel)
     await Timer(1, unit="us")
     return int(dut.uo_out.value) >> 7
 
@@ -571,7 +594,7 @@ async def test_dot_reset_is_co(dut):
     assert [await dp(dut, d) for d in range(4)] == [1, 0, 0, 0]
     await step(dut)
     assert [await dp(dut, d) for d in range(4)] == [1, 1, 0, 0]
-    dut.ui_in.value = ui(0, 0)
+    drive(dut, 0, 0)
     await Timer(1, unit="us")
     assert int(dut.uo_out.value) >> 7 == 0, "CO is low with EN = 0"
 
@@ -594,7 +617,7 @@ async def test_dot_inverse_co(dut):
         assert await dp(dut, 0) == (0 if i % 4 == 3 else 1), f"step {i}"
         await step(dut)
     # With EN = 0 CO is low, so the inverse is high
-    dut.ui_in.value = ui(0, 0)
+    drive(dut, 0, 0)
     await Timer(1, unit="us")
     assert int(dut.uo_out.value) >> 7 == 1
 
@@ -603,7 +626,7 @@ async def dots(dut, en):
     # uo_out[7] of all four digits (lowest first) with the given EN
     values = []
     for sel in range(4):
-        dut.ui_in.value = ui(en, sel)
+        drive(dut, en, sel)
         await Timer(1, unit="us")
         values.append(int(dut.uo_out.value) >> 7)
     return values
@@ -636,7 +659,7 @@ async def test_dot_off_keeps_carry(dut):
         expected = [n % 4, n // 4 % 3, n // 12 % 10, 0]
         assert values == [PATTERNS[e] for e in expected], f"count {n}"
         assert await dots(dut, 1) == [0] * 4, f"count {n}"
-        dut.ui_in.value = ui(1, 0)
+        drive(dut, 1, 0)
         await FallingEdge(dut.clk)
 
 
@@ -692,7 +715,7 @@ async def check_digits(dut, digits, what, en=1):
 async def set_ctrl(dut, value):
     # Write CTRL with EN = 0, so no clock edge counts in the old direction
     # while the write is on its way, and stop at a falling edge
-    dut.ui_in.value = ui(0, 0)
+    drive(dut, 0, 0)
     await spi_write(dut, CTRL, value)
     await FallingEdge(dut.clk)
 
@@ -824,14 +847,14 @@ async def test_ctrl_alone(dut):
         # All four digits with EN = 1 in one pass: segments and dot together
         out = []
         for sel in range(4):
-            dut.ui_in.value = ui(1, sel)
+            drive(dut, 1, sel)
             await Timer(1, unit="us")
             out.append(int(dut.uo_out.value))
         assert [o & 0x7F for o in out] == [0 if d == 0 else PATTERNS[d] for d in digits], f"step {n}"
         assert [o >> 7 for o in out] == [0, 1, zeros[2], 1 - zeros[3]], f"step {n}"
         await step(dut)
     # The other registers leave CTRL alone: still counting down
-    dut.ui_in.value = ui(0, 0)
+    drive(dut, 0, 0)
     await spi_writes(dut, (MODE, 0x00), (DOT, DOT_RESET), (BASE10, 0x43), (BASE32, 0x65))
     await FallingEdge(dut.clk)
     digits = after_down(130, [3, 4, 5, 6])
@@ -863,10 +886,10 @@ async def load_reg(dut, *writes, en=1, bits=16):
     # a rising edge and take at most 6.6 us, so they end before the next one.
     # EN is 0 until the writes begin, so the edge before them cannot count.
     # EN is `en` while they run, so the loading edge has that EN.
-    dut.ui_in.value = ui(0, 0)
+    drive(dut, 0, 0)
     await RisingEdge(dut.clk)
     await Timer(100, unit="ns")
-    dut.ui_in.value = ui(en, 0)
+    drive(dut, en, 0)
     await spi_writes(dut, *writes, bits=bits)
     await RisingEdge(dut.clk)
     await FallingEdge(dut.clk)
@@ -896,7 +919,7 @@ async def test_count_loads_on_next_edge(dut):
 
 
 async def check_digits_one(dut, sel, digit, en=1):
-    dut.ui_in.value = ui(en, sel)
+    drive(dut, en, sel)
     await Timer(1, unit="us")
     assert int(dut.uo_out.value) & 0x7F == PATTERNS[digit], f"digit {sel}"
 
@@ -908,7 +931,7 @@ async def test_count_both_registers_one_edge(dut):
     await write_count(dut, 0x1234, en=0)
     await check_digits(dut, [4, 3, 2, 1], "loaded with EN = 0", en=0)
     for sel in range(4):
-        dut.ui_in.value = ui(0, sel)
+        drive(dut, 0, sel)
         await Timer(1, unit="us")
         assert int(dut.uo_out.value) & 0x7F == PATTERNS[[4, 3, 2, 1][sel]]
     await FallingEdge(dut.clk)
@@ -1040,7 +1063,7 @@ async def test_count_leaves_other_registers(dut):
     await write_count(dut, 0x1234, en=0)
     expected = [shown(4) | 0x80, MINUS, 0x80, shown(1) | 0x80]
     for sel in range(4):
-        dut.ui_in.value = ui(0, sel)
+        drive(dut, 0, sel)
         await Timer(1, unit="us")
         assert int(dut.uo_out.value) == expected[sel], f"digit {sel}"
     # Writing another register loads nothing
@@ -1048,10 +1071,62 @@ async def test_count_leaves_other_registers(dut):
     await FallingEdge(dut.clk)
     await check_digits_one(dut, 0, 4, en=0)
     # Down is still on, and the bases are still 10 6 10 6
-    dut.ui_in.value = ui(1, 0)
+    drive(dut, 1, 0)
     await FallingEdge(dut.clk)
     assert await lit(dut, 0) == PATTERNS[3], "still counting down"
     await write_count(dut, 0x0000)
     await step(dut, 1)
     await check_digits_one(dut, 0, 9)
     await check_digits_one(dut, 3, 5)
+
+
+@cocotb.test()
+async def test_sel_change_between_writes_keeps_write(dut):
+    # SEL changes between and during SPI writes must not corrupt a write
+    await start(dut, 0, base=0)
+    dut.ui_in.value = 0
+
+    async def wiggle():
+        for i in range(40):
+            set_sel(dut, i % 4)
+            await Timer(77, unit="ns")
+
+    cocotb.start_soon(wiggle())
+    await spi_writes(dut, (BASE10, 0x43), (BASE32, 0x43), (MODE, 0x54))
+    await Timer(5, unit="us")
+    set_sel(dut, 0)
+    assert await read_settings(dut) == ([3, 4, 3, 4], 0x54)
+    # Count too: the write above did not change anything else
+    await write_count(dut, 0x2359, en=0)
+    assert await read_digits(dut, en=0) == [PATTERNS[9], PATTERNS[5], PATTERNS[3], PATTERNS[2]]
+
+
+@cocotb.test()
+async def test_spi_does_not_change_sel(dut):
+    # SPI traffic on uio_in[3:0] does not move SEL on uio_in[5:4]
+    await start(dut, 0, base=0)
+    await write_count(dut, 0x4321, en=0)
+    for sel in range(4):
+        set_sel(dut, sel)
+        # a full write and a cut-short one, with SCK toggling the whole time
+        await spi_write(dut, MODE, 0x00)
+        await spi_write(dut, DOT, 0x00, bits=5)
+        await Timer(1, unit="us")
+        assert (int(dut.uio_in.value) >> 4) & 3 == sel
+        assert int(dut.uo_out.value) & 0x7F == PATTERNS[(0x4321 >> (4 * sel)) & 0xF], f"sel {sel}"
+
+
+@cocotb.test()
+async def test_ui_in_2_1_select_nothing(dut):
+    # ui_in[2:1] no longer select the digit: with SEL on the uio pins fixed
+    # the display stays on that digit whatever ui_in[2:1] are
+    await start(dut, 0, base=0)
+    await write_count(dut, 0x4321, en=0)
+    for sel in range(4):
+        set_sel(dut, sel)
+        for bits in range(4):
+            dut.ui_in.value = bits << 1
+            await Timer(1, unit="us")
+            assert int(dut.uo_out.value) & 0x7F == PATTERNS[(0x4321 >> (4 * sel)) & 0xF], f"sel {sel} ui {bits}"
+        # a SEL pin on ui_in[2:1] does not count either
+    dut.ui_in.value = 0
