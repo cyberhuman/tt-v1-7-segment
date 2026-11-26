@@ -10,16 +10,16 @@ PATTERNS = [0x3F, 0x06, 0x5B, 0x4F, 0x66, 0x6D, 0x7D, 0x07,
             0x7F, 0x6F, 0x77, 0x7C, 0x39, 0x5E, 0x79, 0x71]
 
 
-def ui(en, sel):
-    # ui_in bit 0 is EN, bits 2:1 are SEL
-    return en | (sel << 1)
+def ui(en, sel, base=0):
+    # ui_in bit 0 is EN, bits 2:1 are SEL, bits 6:3 are the count base
+    return en | (sel << 1) | (base << 3)
 
 
-async def start(dut, en, sel=0):
+async def start(dut, en, sel=0, base=0):
     # Start the clock, hold reset for a few cycles, then release it
     cocotb.start_soon(Clock(dut.clk, 10, unit="us").start())
     dut.ena.value = 1
-    dut.ui_in.value = ui(en, sel)
+    dut.ui_in.value = ui(en, sel, base)
     dut.uio_in.value = 0
     dut.rst_n.value = 0
     await ClockCycles(dut.clk, 5)
@@ -33,11 +33,11 @@ def shown(digit, co=0):
     return PATTERNS[digit] | (0x80 if co else 0)
 
 
-async def read_digits(dut, en=1):
+async def read_digits(dut, en=1, base=0):
     # Read all four digits (lowest first) by switching SEL, no clock edge needed
     values = []
     for sel in range(4):
-        dut.ui_in.value = ui(en, sel)
+        dut.ui_in.value = ui(en, sel, base)
         await Timer(1, unit="us")
         values.append(int(dut.uo_out.value) & 0x7F)
     return values
@@ -141,3 +141,55 @@ async def test_co_of_shown_digit(dut):
     dut.ui_in.value = ui(0, 1)
     await Timer(1, unit="us")
     assert dut.uo_out.value == PATTERNS[0xF]
+
+
+@cocotb.test()
+async def test_base10_digit0(dut):
+    await start(dut, 1, base=10)
+    # Lowest digit shows 0..9 then 0, never A..F, CO high only while it shows 9
+    for i in range(25):
+        digit = i % 10
+        assert dut.uo_out.value == shown(digit, digit == 9), f"step {i}"
+        await FallingEdge(dut.clk)
+
+
+@cocotb.test()
+async def test_base10_count_100(dut):
+    await start(dut, 1, base=10)
+    # Each step the decimal value is one more, digit1 steps when digit0 wraps
+    for n in range(105):
+        values = await read_digits(dut, base=10)
+        expected = [(n // 10 ** d) % 10 for d in range(4)]
+        assert values == [PATTERNS[e] for e in expected], f"count {n}"
+        dut.ui_in.value = ui(1, 0, 10)
+        await FallingEdge(dut.clk)
+    # 105 reached: digit2 stepped once when 99 went to 100
+
+
+@cocotb.test()
+async def test_base3(dut):
+    await start(dut, 1, base=3)
+    # Digit0 cycles 0, 1, 2, CO only at 2; the carry reaches digit1 after 3 clocks
+    for n in range(10):
+        values = await read_digits(dut, base=3)
+        expected = [(n // 3 ** d) % 3 for d in range(4)]
+        assert values == [PATTERNS[e] for e in expected], f"count {n}"
+        dut.ui_in.value = ui(1, 0, 3)
+        await Timer(1, unit="us")
+        assert dut.uo_out.value == shown(n % 3, n % 3 == 2), f"co at {n}"
+        await FallingEdge(dut.clk)
+
+
+@cocotb.test()
+async def test_base_en_holds(dut):
+    await start(dut, 1, base=10)
+    # Count to 17, then EN = 0 with base 10 holds all digits
+    for _ in range(17):
+        await FallingEdge(dut.clk)
+    before = await read_digits(dut, en=0, base=10)
+    assert before == [PATTERNS[7], PATTERNS[1], PATTERNS[0], PATTERNS[0]]
+    await ClockCycles(dut.clk, 25)
+    assert await read_digits(dut, en=0, base=10) == before
+    dut.ui_in.value = ui(0, 0, 10)
+    await Timer(1, unit="us")
+    assert dut.uo_out.value == PATTERNS[7], "CO low with EN = 0"

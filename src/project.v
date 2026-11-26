@@ -5,11 +5,12 @@
 
 `default_nettype none
 
-// One hex digit: a 4-bit counter and its 7 segment pattern
-module hex_digit (
+// One digit: a 4-bit counter and its 7 segment pattern
+module digit (
     input  wire       clk,    // clock
     input  wire       rst_n,  // reset_n - low to reset
     input  wire       en,     // count enable (carry-in)
+    input  wire [3:0] base,   // count base (use 0 for 16)
     output reg  [6:0] seg,    // segments, bits are {g,f,e,d,c,b,a}
     output wire       co      // carry-out
 );
@@ -18,8 +19,8 @@ module hex_digit (
   reg [3:0] count;
 
   // The table of segment patterns: one hex digit in, its pattern out
-  function [6:0] seg7(input [3:0] digit);
-    case (digit)
+  function [6:0] seg7(input [3:0] value);
+    case (value)
       //              gfedcba
       4'h0: seg7 = 7'b0111111;
       4'h1: seg7 = 7'b0000110;
@@ -44,7 +45,9 @@ module hex_digit (
   localparam [6:0] SEG_RESET = seg7(4'h0);
 
   // What the counter will be after the next clock edge: one more when EN is 1
-  wire [3:0] next_count = en ? count + 4'd1 : count;
+  wire [3:0] next_count_raw = en ? count + 4'd1 : count;
+
+  wire [3:0] next_count = base == next_count_raw ? 4'd0 : next_count_raw;
 
   // Segment pattern for that next digit (plain logic, no flip-flops)
   wire [6:0] next_seg = seg7(next_count);
@@ -62,7 +65,7 @@ module hex_digit (
   end
 
   // Carry out: high when EN is 1 and the digit is F
-  assign co = en & (count == 4'hF);
+  assign co = en & (count + 4'd1 == base);
 
 endmodule
 
@@ -83,6 +86,9 @@ module tt_um_cyberhuman_7segment (
   // SEL picks which digit is shown: 0 = lowest digit, 3 = highest digit
   wire [1:0] sel = ui_in[2:1];
 
+  // counter base, all digits
+  wire [3:0] base = ui_in[6:3];
+
   // Segments and carry-out of each of the four digits
   wire [6:0] seg0, seg1, seg2, seg3;
   wire       co0, co1, co2, co3;
@@ -90,10 +96,10 @@ module tt_um_cyberhuman_7segment (
   // Four digits in a chain: together a 16-bit counter 0000..FFFF.
   // The lowest digit counts when EN is 1, each next digit counts when the
   // digit before it has a carry-out.
-  hex_digit digit0 (.clk(clk), .rst_n(rst_n), .en(en),  .seg(seg0), .co(co0));
-  hex_digit digit1 (.clk(clk), .rst_n(rst_n), .en(co0), .seg(seg1), .co(co1));
-  hex_digit digit2 (.clk(clk), .rst_n(rst_n), .en(co1), .seg(seg2), .co(co2));
-  hex_digit digit3 (.clk(clk), .rst_n(rst_n), .en(co2), .seg(seg3), .co(co3));
+  digit digit0 (.clk, .rst_n, .en,      .base, .seg(seg0), .co(co0));
+  digit digit1 (.clk, .rst_n, .en(co0), .base, .seg(seg1), .co(co1));
+  digit digit2 (.clk, .rst_n, .en(co1), .base, .seg(seg2), .co(co2));
+  digit digit3 (.clk, .rst_n, .en(co2), .base, .seg(seg3), .co(co3));
 
   // The selector: SEL chooses which digit's {co, seg} goes to the output pins.
   // It is plain logic after the flip-flops, so a switch change shows at once,
@@ -113,6 +119,6 @@ module tt_um_cyberhuman_7segment (
   assign uio_oe  = 0;
 
   // List all unused inputs to prevent warnings
-  wire _unused = &{ena, uio_in, ui_in[7:3], 1'b0};
+  wire _unused = &{ena, uio_in, ui_in[7], 1'b0};
 
 endmodule
