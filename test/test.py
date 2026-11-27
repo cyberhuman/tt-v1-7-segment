@@ -19,43 +19,43 @@ PATTERNS = [0x3F, 0x06, 0x5B, 0x4F, 0x66, 0x6D, 0x7D, 0x07,
             0x7F, 0x6F, 0x77, 0x7C, 0x39, 0x5E, 0x79, 0x71]
 
 
-# SPI pins on uio_in: bit 0 CS (active low), bit 1 MOSI, bit 3 SCK.
+# SPI pins on ui_in: bit 0 CS (active low), bit 1 MOSI, bit 2 SCK.
+# EN is on ui_in bit 3, INC on bit 4 and DEC on bit 5.
 # SEL is on uio_in bits 5:4 (SEL0 on bit 4). The base is written over SPI.
-CS, MOSI, SCK = 0x01, 0x02, 0x08
+CS, MOSI, SCK = 0x01, 0x02, 0x04
+EN_BIT = 0x08
+INC_BIT = 0x10
+DEC_BIT = 0x20
 SEL_SHIFT = 4
 
-# The SEL value now on the pins. Every write to uio_in goes through uio_set,
-# which adds it, so an SPI write never disturbs SEL and a SEL change never
-# disturbs the SPI lines.
+# The levels now on the pins. Every write to ui_in goes through pins_now and
+# every write to uio_in through uio_now, which add the other levels, so an SPI
+# write never disturbs EN, INC and DEC, and a change of one of them never
+# disturbs the SPI lines or SEL.
 sel_now = 0
 spi_now = CS  # the SPI lines now on the pins
-
-
-def uio_set(dut, spi):
-    # Drive uio_in: the SPI lines in bits 3:0 and SEL in bits 5:4
-    global spi_now
-    spi_now = spi
-    dut.uio_in.value = spi | (sel_now << SEL_SHIFT)
-
-
-def set_sel(dut, sel):
-    # Change SEL only, the SPI lines keep their level
-    global sel_now
-    sel_now = sel
-    uio_set(dut, spi_now)
-
-
-# INC is on ui_in bit 1 and DEC on bit 2. Like SEL they keep their level when
-# EN is driven.
-INC_BIT = 0x02
-DEC_BIT = 0x04
 inc_now = 0
 dec_now = 0
 en_now = 0  # EN last driven
 
 
 def pins_now(dut):
-    dut.ui_in.value = en_now | inc_now * INC_BIT | dec_now * DEC_BIT
+    dut.ui_in.value = spi_now | en_now * EN_BIT | inc_now * INC_BIT | dec_now * DEC_BIT
+    dut.uio_in.value = sel_now << SEL_SHIFT
+
+
+def uio_set(dut, spi):
+    # Drive the SPI lines (CS, MOSI, SCK) in ui_in bits 2:0
+    global spi_now
+    spi_now = spi
+    pins_now(dut)
+
+
+def set_sel(dut, sel):
+    # Change SEL only, the other pins keep their level
+    global sel_now
+    sel_now = sel
+    pins_now(dut)
 
 
 def set_inc(dut, level):
@@ -73,11 +73,11 @@ def set_dec(dut, level):
 
 
 def drive(dut, en, sel):
-    # ui_in bit 0 is EN, bit 1 is INC, bit 2 is DEC; SEL goes to uio_in bits 5:4
-    global en_now
+    # EN is on ui_in bit 3; SEL goes to uio_in bits 5:4
+    global en_now, sel_now
     en_now = en
+    sel_now = sel
     pins_now(dut)
-    set_sel(dut, sel)
 SPI_HALF = 100  # ns, half of one SCK period
 
 
@@ -1144,7 +1144,6 @@ async def test_count_leaves_other_registers(dut):
 async def test_sel_change_between_writes_keeps_write(dut):
     # SEL changes between and during SPI writes must not corrupt a write
     await start(dut, 0, base=0)
-    dut.ui_in.value = 0
 
     async def wiggle():
         for i in range(40):
@@ -1163,7 +1162,7 @@ async def test_sel_change_between_writes_keeps_write(dut):
 
 @cocotb.test()
 async def test_spi_does_not_change_sel(dut):
-    # SPI traffic on uio_in[3:0] does not move SEL on uio_in[5:4]
+    # SPI traffic on ui_in[2:0] does not move the digit picked by SEL on uio_in[5:4]
     await start(dut, 0, base=0)
     await write_count(dut, 0x4321, en=0)
     for sel in range(4):
@@ -1172,24 +1171,24 @@ async def test_spi_does_not_change_sel(dut):
         await spi_write(dut, MODE, 0x00)
         await spi_write(dut, DOT, 0x00, bits=5)
         await Timer(1, unit="us")
-        assert (int(dut.uio_in.value) >> 4) & 3 == sel
         assert int(dut.uo_out.value) & 0x7F == PATTERNS[(0x4321 >> (4 * sel)) & 0xF], f"sel {sel}"
 
 
 @cocotb.test()
-async def test_ui_in_2_1_select_nothing(dut):
-    # ui_in[2:1] no longer select the digit: with SEL on the uio pins fixed
-    # the display stays on that digit whatever ui_in[2:1] are
+async def test_unused_inputs_select_nothing(dut):
+    # ui_in[7:6] and uio_in[3:0] are unused: with SEL on uio_in[5:4] fixed
+    # the display stays on that digit whatever they are
     await start(dut, 0, base=0)
     await write_count(dut, 0x4321, en=0)
     for sel in range(4):
         set_sel(dut, sel)
         for bits in range(4):
-            dut.ui_in.value = bits << 1
-            await Timer(1, unit="us")
-            assert int(dut.uo_out.value) & 0x7F == PATTERNS[(0x4321 >> (4 * sel)) & 0xF], f"sel {sel} ui {bits}"
-        # a SEL pin on ui_in[2:1] does not count either
-    dut.ui_in.value = 0
+            for low in (0x0, 0x5, 0xA, 0xF):
+                dut.ui_in.value = spi_now | bits << 6
+                dut.uio_in.value = sel << SEL_SHIFT | low
+                await Timer(1, unit="us")
+                assert int(dut.uo_out.value) & 0x7F == PATTERNS[(0x4321 >> (4 * sel)) & 0xF], f"sel {sel} ui {bits} uio {low}"
+    pins_now(dut)
 
 
 # INC, DEC and the count mode (CTRL bits 1:0). In the modes 1 to 3 a step

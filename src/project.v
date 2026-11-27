@@ -268,8 +268,8 @@ module tt_um_cyberhuman_7segment (
     input  wire       rst_n     // reset_n - low to reset
 );
 
-  // EN is the count enable, it comes from input pin 0
-  wire en = ui_in[0];
+  // EN is the count enable, it comes from input pin 3
+  wire en = ui_in[3];
   wire en_cnt;  // EN as the counter sees it
   en_delay en_pad (.i(en), .z(en_cnt));
 
@@ -279,11 +279,11 @@ module tt_um_cyberhuman_7segment (
   // picks the digit itself (see the scan counter below).
   wire [1:0] sel_pin = uio_in[5:4];
 
-  // SPI pins: uio[0] is CS (active low), uio[1] is MOSI, uio[3] is SCK.
+  // SPI pins: ui[0] is CS (active low), ui[1] is MOSI, ui[2] is SCK.
   // uio[2] is kept for MISO, it is not driven.
-  wire cs_n = uio_in[0];
-  wire mosi = uio_in[1];
-  wire sck  = uio_in[3];
+  wire cs_n = ui_in[0];
+  wire mosi = ui_in[1];
+  wire sck  = ui_in[2];
 
   // Display mode, decimal point and counter base of each digit, and the
   // count direction, set over SPI (after reset every digit is shown as is,
@@ -299,14 +299,14 @@ module tt_um_cyberhuman_7segment (
                       .tgl10, .tgl32, .base0, .base1, .base2, .base3);
 
   // INC counts up and DEC counts down in the modes 1 to 3. They come from
-  // input pins 1 and 2. A step happens when the input is pressed.
+  // input pins 4 and 5. A step happens when the input is pressed.
   // Why it works: the counter has one clock, a delayed copy of INC or DEC,
   // so its rising edge is the press. The digits have both next counts ready;
   // the DEC pin itself picks one in front of the flip-flops, and the clock
   // edge arrives later than that choice (the delay line, checked by STA).
   // While DEC is low the up count waits, so an INC press needs no switch.
-  wire inc = ui_in[1];
-  wire dec = ui_in[2];
+  wire inc = ui_in[4];
+  wire dec = ui_in[5];
 
   // The direction flip-flop: the rising edge of DEC sets it (D is constant 1),
   // INC high clears it (INC wins if both are high), and so does reset (an OR
@@ -435,7 +435,7 @@ module tt_um_cyberhuman_7segment (
   // The digit select goes out on the bidirectional pins. Mode 2: the scan
   // number on uio[5:4]. Mode 3: one active-high line per digit on uio[7:4]
   // (uio[4] is digit 0). In the modes 0 and 1 nothing is driven. uio[3:0]
-  // (SPI) are never outputs.
+  // are never outputs.
   wire mode2 = count_mode == 2'd2;
   wire mode3 = count_mode == 2'd3;
   wire [3:0] one_hot = 4'b0001 << scan;
@@ -443,6 +443,6 @@ module tt_um_cyberhuman_7segment (
   assign uio_oe  = mode3 ? 8'hF0 : mode2 ? 8'h30 : 8'h00;
 
   // List all unused inputs to prevent warnings
-  wire _unused = &{ena, uio_in[7:6], uio_in[2], ui_in[7:3], 1'b0};
+  wire _unused = &{ena, uio_in[7:6], uio_in[3:0], ui_in[7:6], 1'b0};
 
 endmodule

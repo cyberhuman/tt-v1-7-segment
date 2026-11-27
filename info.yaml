@@ -17,12 +17,12 @@ project:
 # This section is for the datasheet/website. Use descriptive names (e.g., RX, TX, MOSI, SCL, SEG_A, etc.).
 pinout:
   # Inputs
-  ui[0]: "EN"
-  ui[1]: "INC"
-  ui[2]: "DEC"
-  ui[3]: ""
-  ui[4]: ""
-  ui[5]: ""
+  ui[0]: "CS"
+  ui[1]: "MOSI"
+  ui[2]: "SCK"
+  ui[3]: "EN"
+  ui[4]: "INC"
+  ui[5]: "DEC"
   ui[6]: ""
   ui[7]: ""
 
@@ -37,10 +37,10 @@ pinout:
   uo[7]: "DP"
 
   # Bidirectional pins
-  uio[0]: "CS"
-  uio[1]: "MOSI"
+  uio[0]: ""
+  uio[1]: ""
   uio[2]: ""
-  uio[3]: "SCK"
+  uio[3]: ""
   uio[4]: "SEL0 / DIG0"
   uio[5]: "SEL1 / DIG1"
   uio[6]: "DIG2"

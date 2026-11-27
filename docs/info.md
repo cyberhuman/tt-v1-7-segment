@@ -19,10 +19,10 @@ show it as is, show it unless it is 0 (so a 0 can be left blank), show
 nothing, or show a minus. The decimal point of each digit can be off, on, the
 carry-out of the digit or its inverse. The display shows one digit at a time.
 
-- `ui[0]` is **EN**, the count enable (carry-in of the lowest digit). With
+- `ui[3]` is **EN**, the count enable (carry-in of the lowest digit). With
   EN = 1 the counter steps on each counter clock edge. With EN = 0 it holds
   its value. EN works in every count mode.
-- `ui[1]` is **INC** and `ui[2]` is **DEC**, the counting inputs in the count
+- `ui[4]` is **INC** and `ui[5]` is **DEC**, the counting inputs in the count
   modes 1 to 3. INC counts up and DEC counts down, each when it is pressed:
   the step comes on the rising edge of the pin, nothing happens on release.
   `clk` does not count then. Use one at a time: pressing both together is not
@@ -39,7 +39,7 @@ carry-out of the digit or its inverse. The display shows one digit at a time.
   CO. CO is high while EN = 1 and that digit and all the digits below it are
   F; with the highest digit selected it is the carry-out of the whole counter.
   After reset it is CO.
-- `uio[0]`, `uio[1]` and `uio[3]` are **CS** (active low), **MOSI** and
+- `ui[0]`, `ui[1]` and `ui[2]` are **CS** (active low), **MOSI** and
   **SCK** of an SPI port (mode 0, MSB first) that writes registers. A write is
   16 bits: an address byte, then a data byte. The register takes the data on
   the 16th clock edge, and more writes can follow while CS stays low. A write
@@ -89,11 +89,11 @@ carry-out of the digit or its inverse. The display shows one digit at a time.
 
 | Signal | Mode 0 (reset) | Mode 1 | Mode 2 | Mode 3 |
 |--------|--------|--------|--------|--------|
-| EN (`ui[0]`) | enables the count | enables the count | enables the count | enables the count |
+| EN (`ui[3]`) | enables the count | enables the count | enables the count | enables the count |
 | `clk` | counts | — | steps the scan | steps the scan |
 | UP/DOWN (CTRL bit 2) | direction of the count | — | — | — |
-| INC (`ui[1]`) | — | counts up | counts up | counts up |
-| DEC (`ui[2]`) | — | counts down | counts down | counts down |
+| INC (`ui[4]`) | — | counts up | counts up | counts up |
+| DEC (`ui[5]`) | — | counts down | counts down | counts down |
 | `uio[4]` | in: SEL0 | in: SEL0 | out: scan number, low bit | out: DIG0 |
 | `uio[5]` | in: SEL1 | in: SEL1 | out: scan number, high bit | out: DIG1 |
 | `uio[6]` | — | — | — | out: DIG2 |
@@ -140,12 +140,12 @@ watch them one by one.
 
 | Pin | Name | Direction | Meaning |
 |-----|------|-----------|---------|
-| ui[0] | EN | in | count enable (carry-in) |
-| ui[1] | INC | in | counts up on press, count modes 1 to 3 |
-| ui[2] | DEC | in | counts down on press, count modes 1 to 3 |
-| uio[0] | CS | in | SPI chip select, active low |
-| uio[1] | MOSI | in | SPI data in |
-| uio[3] | SCK | in | SPI clock |
+| ui[0] | CS | in | SPI chip select, active low |
+| ui[1] | MOSI | in | SPI data in |
+| ui[2] | SCK | in | SPI clock |
+| ui[3] | EN | in | count enable (carry-in) |
+| ui[4] | INC | in | counts up on press, count modes 1 to 3 |
+| ui[5] | DEC | in | counts down on press, count modes 1 to 3 |
 | uio[4] | SEL0 / DIG0 | in / out | digit select low bit (modes 0, 1); scan number low bit (mode 2) or digit 0 line (mode 3) |
 | uio[5] | SEL1 / DIG1 | in / out | digit select high bit (modes 0, 1); scan number high bit (mode 2) or digit 1 line (mode 3) |
 | uio[6] | DIG2 | out | digit 2 line, mode 3 only |
@@ -160,13 +160,13 @@ watch them one by one.
 | uo[7] | DP | out | decimal point of the digit shown (CO by default) |
 
 Clock and reset are the dedicated `clk` and `rst_n` pins. The other `ui` pins
-are unused; `uio[2]` is kept for MISO and is not driven.
+and `uio[0]`, `uio[1]` and `uio[3]` are unused; `uio[2]` is kept for MISO and is not driven.
 
 ## How to test
 
 1. Put a 7-segment display on `uo[0]` to `uo[7]` (segments A to G, then the
    decimal point).
-2. Set EN (`ui[0]`) to 1 and SEL (`uio[5:4]`) to 0, the lowest digit.
+2. Set EN (`ui[3]`) to 1 and SEL (`uio[5:4]`) to 0, the lowest digit.
 3. Pull `rst_n` low for a moment, then release it. The display shows 0 and all
    bases are 16. For a clock (10, 6, 10, 6), write 0x00 = 0x6A and 0x01 = 0x6A
    over SPI (CS, MOSI and SCK), between clock edges. To leave a 0 blank on
@@ -182,8 +182,8 @@ are unused; `uio[2]` is kept for MISO and is not driven.
 ## External hardware
 
 A 7-segment display on `uo[0]` to `uo[7]` (active high), switches for EN
-(`ui[0]`), push buttons for INC and DEC (`ui[1]`, `ui[2]`) and SEL (`uio[4]`, `uio[5]`; outputs in the modes 2 and 3), an SPI controller (for example the
-RP2040 on the demo board) on `uio[0]`, `uio[1]` and `uio[3]`, and a slow clock
+(`ui[3]`), push buttons for INC and DEC (`ui[4]`, `ui[5]`) and SEL (`uio[4]`, `uio[5]`; outputs in the modes 2 and 3), an SPI controller (for example the
+RP2040 on the demo board) on `ui[0]`, `ui[1]` and `ui[2]`, and a slow clock
 source or a push button on `clk`.
 
 For a four-digit multiplexed display, set the mode to 2 or 3 and put the four
