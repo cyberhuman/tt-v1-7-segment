@@ -47,6 +47,17 @@ digit below it wraps. With base 16 for all four digits the count runs from
 0000 to FFFF; with bases 10, 6, 10, 6 (digit 0 first) it runs from 00:00 to
 59:59.
 
+Digit 2 has a second base, for the hours of a clock. Register ALT32 gives the
+base digit 2 uses while digit 3 is at the last digit of its own base; 0 means
+no second base. Counting up, digit 2 then wraps at the last digit of that base.
+Counting down, it wraps from 0 to the last digit of the base that is in effect
+once digit 3 has stepped. CO, CARRY and BORROW follow the base in effect.
+
+| Clock | Bases (digit 0 first) | ALT32 | Counts |
+|-------|-----------------------|-------|--------|
+| 24-hour | 10, 6, 10, 3 | 0x04 | 00:00 to 23:59 |
+| 12-hour | 10, 6, 10, 2 | 0x02 | 00:00 to 11:59 |
+
 EN enables the count: with EN = 0 the counter holds its value. The count mode
 sets what makes a step. In mode 0 it is the rising edge of `clk`, and the
 UP/DOWN bit gives the direction. In the modes 1 to 3 it is a press of INC (up)
@@ -101,6 +112,8 @@ driven while CS is low and is 0 except in the data byte of a read.
 | 0x04 | CTRL | 0x00 | the register | 7:3 unused (read 0); 2 UP/DOWN (0 counts up, 1 counts down); 1:0 count mode |
 | 0x05 | COUNT10 | 0x00 | the count now | 7:4 count of digit 1, 3:0 count of digit 0 |
 | 0x06 | COUNT32 | 0x00 | the count now | 7:4 count of digit 3, 3:0 count of digit 2 |
+| 0x08 | ALT10 | | 0 | reserved, a write does nothing |
+| 0x09 | ALT32 | 0x00 | the register | 7:4 reserved (read 0); 3:0 base of digit 2 while digit 3 is at the last digit of its base (0 means none) |
 
 A write to COUNT10 or COUNT32 sets those two digits at once, with no step, in
 every count mode and whatever EN is. The next step counts from the loaded
@@ -178,8 +191,8 @@ the reset value in the table.
    decimal point).
 2. Set EN (`ui[3]`) to 1 and SEL (`uio[5:4]`) to 0, the lowest digit.
 3. Pull `rst_n` low for a moment, then release it. The display shows 0 and all
-   bases are 16. For a clock (10, 6, 10, 6), write 0x00 = 0x6A and 0x01 = 0x6A
-   over SPI (CS, MOSI and SCK), between clock edges. To leave a 0 blank on
+   bases are 16. For a 24-hour clock, write 0x00 = 0x6A, 0x01 = 0x3A and
+   0x09 = 0x04 over SPI (CS, MOSI and SCK), between clock edges. To leave a 0 blank on
    the three upper digits, write 0x02 = 0x54.
 4. Apply a slow clock to `clk` (about 1 Hz) or press a push button. The display
    counts 0, 1, ... 9, A, b, C, d, E, F and wraps to 0 (with base 10 it stops at 9).

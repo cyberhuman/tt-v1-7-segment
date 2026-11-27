@@ -84,6 +84,10 @@ SPI_HALF = 100  # ns, half of one SCK period
 # Register addresses
 BASE10, BASE32, MODE, DOT, CTRL, COUNT10, COUNT32 = 0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06
 
+# ALT10 (0x08) is reserved. ALT32: bits 3:0 are the base digit 2 uses while
+# digit 3 is at the last digit of its own base (0: none), bits 7:4 are reserved.
+ALT10, ALT32 = 0x08, 0x09
+
 # CTRL bits: 1:0 are the count mode (0 clk, 1 to 3 INC and DEC), bit 2 counts down, 7:3 unused
 DOWN = 0x04
 
@@ -2216,3 +2220,248 @@ async def test_miso_zero_after_cs_high_mid_byte(dut):
     assert miso(dut) == 0, "MISO at the start of the next period"
     uio_set(dut, CS)
     await Timer(SPI_HALF, unit="ns")
+
+
+# The second base of digit 2 (ALT32): the hours of a 24-hour or a 12-hour clock
+
+def last_of(d, b):
+    # The last digit of base b (0 means 16)
+    return (d + 1) & 15 == b & 15
+
+
+def alt_base(alt, d3, bases):
+    # The base digit 2 uses while digit 3 is at d3
+    return alt if alt and last_of(d3, bases[3]) else bases[2]
+
+
+def model_step(d, bases, alt, down):
+    # The digits (lowest first) after one step
+    new = list(d)
+    en = True
+    if not down:
+        b = list(bases)
+        b[2] = alt_base(alt, d[3], bases)
+        for i in range(4):
+            if en:
+                new[i] = 0 if last_of(d[i], b[i]) else (d[i] + 1) & 15
+            en = en and last_of(d[i], b[i])
+    else:
+        # Digit 3 steps on the same edge: digit 2 wraps to the last digit of
+        # the base in effect after that step
+        d3_after = (bases[3] - 1) & 15 if d[3] == 0 else d[3] - 1
+        b = list(bases)
+        b[2] = alt_base(alt, d3_after, bases)
+        for i in range(4):
+            if en:
+                new[i] = (b[i] - 1) & 15 if d[i] == 0 else d[i] - 1
+            en = en and d[i] == 0
+    return new
+
+
+def model_flags(d, bases, alt, down):
+    # (CARRY, BORROW, CO of each digit) for the digits d
+    b = list(bases)
+    b[2] = alt_base(alt, d[3], bases)
+    cos = []
+    for i in range(4):
+        if down:
+            cos.append(int(all(x == 0 for x in d[:i + 1])))
+        else:
+            cos.append(int(all(last_of(d[j], b[j]) for j in range(i + 1))))
+    return int(all(last_of(d[j], b[j]) for j in range(4))), int(all(x == 0 for x in d)), cos
+
+
+async def check_alt_flags(dut, d, bases, alt, down, what):
+    # CARRY, BORROW and the CO of each digit (on the dot) with EN = 1
+    carry, borrow, cos = model_flags(d, bases, alt, down)
+    for sel in range(4):
+        drive(dut, 1, sel)
+        await Timer(500, unit="ns")
+        assert carry_borrow(dut) == (carry, borrow), f"{what}: {d} CARRY BORROW"
+        assert int(dut.uo_out.value) >> 7 == cos[sel], f"{what}: {d} CO of digit {sel}"
+    drive(dut, 0, 0)
+
+
+async def run_alt(dut, mode, down, bases, alt, cases, expect=None):
+    # Each case: load the digits, check CARRY, BORROW and CO, step once in the
+    # direction, check the digits against the model (and against `expect`, a
+    # dict from the digits before to the digits after, when given).
+    await start(dut, 0, base=bases)
+    drive(dut, 0, 0)
+    await spi_write(dut, ALT32, alt)
+    await set_mode(dut, mode, DOWN if down and mode == 0 else 0)
+    if mode:
+        await press(dut, "D" if down else "I", en=0)
+    for d in cases:
+        await load_digits(dut, d)
+        await check_alt_flags(dut, d, bases, alt, down, f"mode {mode}")
+        if mode == 0:
+            await one_step(dut)
+        else:
+            await press(dut, "D" if down else "I")
+        want = model_step(d, bases, alt, down)
+        if expect and tuple(d) in expect:
+            assert want == list(expect[tuple(d)]), f"model {d}"
+        await check_digits(dut, want, f"mode {mode} down {down}: {d}", en=0)
+
+
+# hh:mm as digits, lowest first: 19:59 is [9, 5, 9, 1]
+CLOCK_24 = [10, 6, 10, 3]
+CASES_24 = [[0, 0, 0, 0], [9, 5, 9, 1], [9, 5, 3, 2], [0, 0, 0, 2], [9, 5, 2, 2],
+            [9, 5, 0, 2], [4, 3, 2, 1], [9, 5, 9, 0], [0, 0, 4, 2], [9, 5, 4, 2],
+            [0, 0, 9, 2], [0, 0, 3, 2], [1, 0, 0, 0], [0, 1, 0, 0], [15, 15, 15, 15]]
+UP_24 = {(9, 5, 9, 1): (0, 0, 0, 2), (9, 5, 3, 2): (0, 0, 0, 0), (0, 0, 0, 2): (1, 0, 0, 2),
+         (9, 5, 2, 2): (0, 0, 3, 2), (9, 5, 9, 0): (0, 0, 0, 1)}
+DOWN_24 = {(0, 0, 0, 0): (9, 5, 3, 2), (0, 0, 0, 2): (9, 5, 9, 1), (0, 0, 0, 1): (9, 5, 9, 0),
+           (0, 0, 3, 2): (9, 5, 2, 2), (0, 0, 9, 2): (9, 5, 8, 2)}
+CLOCK_12 = [10, 6, 10, 2]
+CASES_12 = [[0, 0, 0, 0], [9, 5, 9, 0], [9, 5, 1, 1], [9, 5, 0, 1], [0, 0, 0, 1],
+            [0, 0, 1, 1], [4, 3, 1, 0], [9, 5, 2, 1], [0, 0, 2, 0], [0, 0, 9, 1], [15, 15, 15, 15]]
+UP_12 = {(9, 5, 9, 0): (0, 0, 0, 1), (9, 5, 1, 1): (0, 0, 0, 0), (9, 5, 0, 1): (0, 0, 1, 1),
+         (9, 5, 1, 0): (0, 0, 2, 0)}
+DOWN_12 = {(0, 0, 0, 0): (9, 5, 1, 1), (0, 0, 0, 1): (9, 5, 9, 0), (0, 0, 1, 1): (9, 5, 0, 1)}
+
+
+@cocotb.test()
+async def test_alt_24h_up_clk(dut):
+    await run_alt(dut, 0, False, CLOCK_24, 4, CASES_24, UP_24)
+
+
+@cocotb.test()
+async def test_alt_24h_down_clk(dut):
+    await run_alt(dut, 0, True, CLOCK_24, 4, CASES_24, DOWN_24)
+
+
+@cocotb.test()
+async def test_alt_24h_up_inc(dut):
+    await run_alt(dut, 1, False, CLOCK_24, 4, CASES_24, UP_24)
+
+
+# Skipped in the gate level run without delays: presses DEC, and that race needs the gate delays.
+@cocotb.test(skip=GL_NO_DELAY)
+async def test_alt_24h_down_dec(dut):
+    await run_alt(dut, 1, True, CLOCK_24, 4, CASES_24, DOWN_24)
+
+
+@cocotb.test()
+async def test_alt_12h_up_clk(dut):
+    await run_alt(dut, 0, False, CLOCK_12, 2, CASES_12, UP_12)
+
+
+@cocotb.test()
+async def test_alt_12h_down_clk(dut):
+    await run_alt(dut, 0, True, CLOCK_12, 2, CASES_12, DOWN_12)
+
+
+@cocotb.test()
+async def test_alt_12h_up_inc(dut):
+    await run_alt(dut, 1, False, CLOCK_12, 2, CASES_12, UP_12)
+
+
+# Skipped in the gate level run without delays: presses DEC, and that race needs the gate delays.
+@cocotb.test(skip=GL_NO_DELAY)
+async def test_alt_12h_down_dec(dut):
+    await run_alt(dut, 1, True, CLOCK_12, 2, CASES_12, DOWN_12)
+
+
+@cocotb.test()
+async def test_alt_zero_changes_nothing(dut):
+    # No override: digit 2 keeps its own base, up and down, and digit 3 counts as before
+    cases = [[9, 5, 9, 1], [9, 5, 3, 2], [9, 5, 9, 2], [0, 0, 0, 0], [0, 0, 0, 2], [9, 5, 2, 2]]
+    await run_alt(dut, 0, False, CLOCK_24, 0, cases,
+                  {(9, 5, 3, 2): (0, 0, 4, 2), (9, 5, 9, 2): (0, 0, 0, 0)})
+    await run_alt(dut, 0, True, CLOCK_24, 0, cases,
+                  {(0, 0, 0, 0): (9, 5, 9, 2), (0, 0, 0, 2): (9, 5, 9, 1)})
+
+
+@cocotb.test()
+async def test_alt_full_day_clk(dut):
+    # 24-hour clock through a whole day and the wrap, up and then down
+    await start(dut, 0, base=CLOCK_24)
+    drive(dut, 0, 0)
+    await spi_write(dut, ALT32, 4)
+    await load_digits(dut, [0, 0, 0, 0])
+    d = [0, 0, 0, 0]
+    for n in range(24 * 60 + 2):
+        await one_step(dut)
+        d = model_step(d, CLOCK_24, 4, False)
+        m = (n + 1) % 1440
+        assert d == [m % 10, m // 10 % 6, m // 60 % 10, m // 600], f"model {n}"
+        if n % 37 == 0 or m % 60 in (0, 59):
+            await check_digits(dut, d, f"step {n}", en=0)
+    await set_ctrl(dut, DOWN)
+    for n in range(24 * 60 + 2):
+        await one_step(dut)
+        d = model_step(d, CLOCK_24, 4, True)
+        if n % 37 == 0 or n >= 1438:
+            await check_digits(dut, d, f"down step {n}", en=0)
+
+
+@cocotb.test()
+async def test_alt_read_back(dut):
+    await start(dut, 0)
+    drive(dut, 0, 0)
+    assert await spi_read(dut, ALT32) == 0
+    for value in (0x04, 0x02, 0x0F, 0x01, 0x00):
+        await spi_write(dut, ALT32, value)
+        assert await spi_read(dut, ALT32) == value
+    # Bits 7:4 are reserved: ignored, read 0
+    await spi_write(dut, ALT32, 0xF5)
+    assert await spi_read(dut, ALT32) == 0x05
+    await spi_write(dut, ALT32, 0xF0)
+    assert await spi_read(dut, ALT32) == 0x00
+    # The other registers are not touched by it
+    assert await read_all(dut) == [0, 0, 0, DOT_RESET, 0, 0, 0]
+
+
+@cocotb.test()
+async def test_alt_reserved_bits_do_not_override(dut):
+    # 0xF0 is no override: 23:59 goes on to 24:00 in base 10
+    await start(dut, 0, base=CLOCK_24)
+    drive(dut, 0, 0)
+    await spi_write(dut, ALT32, 0xF0)
+    await load_digits(dut, [9, 5, 3, 2])
+    await one_step(dut)
+    await check_digits(dut, [0, 0, 4, 2], "no override", en=0)
+
+
+@cocotb.test()
+async def test_alt10_is_reserved(dut):
+    await start_preset(dut)
+    await spi_write(dut, ALT32, 0x03)
+    before = await read_settings(dut)
+    for value in (0xFF, 0xA5, 0x00):
+        await spi_write(dut, ALT10, value)
+        assert await spi_read(dut, ALT10) == 0, f"ALT10 reads 0 after {value:#x}"
+        assert await read_settings(dut) == before
+        assert await spi_read(dut, ALT32) == 0x03
+    # And it does not load the counts
+    await load_digits(dut, [1, 2, 3, 1])
+    await spi_write(dut, ALT10, 0xFF)
+    await check_digits(dut, [1, 2, 3, 1], "ALT10 loads nothing", en=0)
+
+
+@cocotb.test()
+async def test_alt_reset_clears(dut):
+    await start(dut, 0, base=CLOCK_24)
+    drive(dut, 0, 0)
+    await spi_write(dut, ALT32, 0x04)
+    assert await spi_read(dut, ALT32) == 0x04
+    dut.rst_n.value = 0
+    await ClockCycles(dut.clk, 3)
+    dut.rst_n.value = 1
+    await FallingEdge(dut.clk)
+    assert await spi_read(dut, ALT32) == 0
+    # After reset the bases are 16 and there is no override
+    await spi_write(dut, BASE32, 0x3A)
+    await load_digits(dut, [15, 15, 3, 2])
+    await one_step(dut)
+    await check_digits(dut, [0, 0, 4, 2], "no override after reset", en=0)
+
+
+@cocotb.test()
+async def test_alt_cut_short_write_ignored(dut):
+    await start(dut, 0)
+    drive(dut, 0, 0)
+    await spi_write(dut, ALT32, 0x05, bits=15)
+    assert await spi_read(dut, ALT32) == 0

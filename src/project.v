@@ -71,7 +71,8 @@ module digit (
     input  wire       en_dn,  // count enable counting down (borrow-in of the down chain)
     input  wire       en_up_s, // the same as en_up, for the carry shown on CO (not delayed, see en_delay)
     input  wire       en_dn_s, // the same as en_dn, for the borrow shown on CO
-    input  wire [3:0] base,   // count base (use 0 for 16)
+    input  wire [3:0] base,   // count base counting up (use 0 for 16)
+    input  wire [3:0] base_dn, // count base counting down, the one in effect after the step (same as base unless the digit has a second base)
     input  wire       pick,   // direction that picks the next count: 0 up, 1 down
     input  wire       down,   // direction that the carry-out shows: 0 up, 1 down
     input  wire       load,   // a high pulse sets the counter to `value` at once (asynchronous)
@@ -83,6 +84,8 @@ module digit (
     output wire       co_dn_s, // borrow-out of the shown down chain (from en_dn_s)
     output wire       co,     // carry-out of the chain that `down` chooses
     output wire       zero,   // the count is 0
+    output wire       at_base, // the count is equal to the base
+    output wire       last,   // the count is the last digit of the base
     output wire [3:0] now     // the count
 );
 
@@ -120,7 +123,7 @@ module digit (
   // taken as is.
   wire [3:0] next_up_raw = count + 4'd1;
   wire [3:0] next_up     = base == next_up_raw ? 4'd0 : next_up_raw;
-  wire [3:0] next_down   = zero ? base - 4'd1 : count - 4'd1;
+  wire [3:0] next_down   = zero ? base_dn - 4'd1 : count - 4'd1;
   wire [3:0] count_up    = !en_up ? count : next_up;
   wire [3:0] count_dn    = !en_dn ? count : next_down;
 
@@ -162,7 +165,8 @@ module digit (
   // count is 0, so the next digit steps down when this one wraps to base - 1.
   // The same chains are built a second time from the undelayed EN for what CO and the
   // dot show, so that the delay of EN (see en_delay) is not in the path from EN to the outputs.
-  wire   last  = (count + 4'd1 == base);
+  assign last  = (count + 4'd1 == base);
+  assign at_base = (count == base);
   assign co_up = en_up & last;
   assign co_dn = en_dn & zero;
   assign co_up_s = en_up_s & last;
@@ -204,7 +208,8 @@ module settings (
     output reg  [3:0] base0,  // count base of digit 0 (0 means 16)
     output reg  [3:0] base1,  // count base of digit 1
     output reg  [3:0] base2,  // count base of digit 2
-    output reg  [3:0] base3   // count base of digit 3
+    output reg  [3:0] base3,  // count base of digit 3
+    output reg  [3:0] alt2    // base of digit 2 while digit 3 is at its last digit (0: none)
 );
 
   // Register addresses (7 bits, the top bit of the address byte is the read bit)
@@ -215,6 +220,8 @@ module settings (
   localparam [6:0] ADDR_CTRL   = 7'h04;  // bits 1:0 are the count mode, bit 2 is down, 7:3 unused
   localparam [6:0] ADDR_COUNT10 = 7'h05;  // {count1, count0}, loaded at once
   localparam [6:0] ADDR_COUNT32 = 7'h06;  // {count3, count2}, loaded at once
+  // 0x08 (second bases of digits 1 and 0) is reserved: writes do nothing, reads 0
+  localparam [6:0] ADDR_ALT32  = 7'h09;  // bits 3:0 are alt2, 7:4 reserved (second base of digit 3)
 
   // The bits received so far in this transfer, newest in bit 0. In a read
   // the byte to send replaces them at the 8th edge and moves up from there.
@@ -237,6 +244,7 @@ module settings (
       ADDR_CTRL:    read_byte = {5'd0, down, count_mode};
       ADDR_COUNT10: read_byte = live10;
       ADDR_COUNT32: read_byte = live32;
+      ADDR_ALT32:   read_byte = {4'd0, alt2};
       default:      read_byte = 8'd0;
     endcase
   endfunction
@@ -288,10 +296,12 @@ module settings (
       base1 <= 4'd0;
       base2 <= 4'd0;
       base3 <= 4'd0;
+      alt2  <= 4'd0;
     end else if (!cs_n && bit_count == 4'd15 && !reading) begin
       case (addr)
         ADDR_BASE10: {base1, base0} <= data;
         ADDR_BASE32: {base3, base2} <= data;
+        ADDR_ALT32:  alt2 <= data[3:0];
         ADDR_MODE:   mode <= data;
         ADDR_DOT:    dot <= data;
         ADDR_CTRL:   begin count_mode <= data[1:0]; down <= data[2]; end
@@ -371,13 +381,13 @@ module tt_um_cyberhuman_7segment (
   wire [7:0] dot;
   wire       down;
   wire [1:0] count_mode;
-  wire [3:0] base0, base1, base2, base3;
+  wire [3:0] base0, base1, base2, base3, alt2;
   wire [7:0] ldata;
   wire [7:0] live10, live32;
   wire       miso;
   wire       ld10, ld32;
   settings settings0 (.sck, .cs_n, .mosi, .rst_n, .live10, .live32, .miso, .mode, .dot, .down, .count_mode, .ldata,
-                      .ld10, .ld32, .base0, .base1, .base2, .base3);
+                      .ld10, .ld32, .base0, .base1, .base2, .base3, .alt2);
 
   // INC counts up and DEC counts down in the modes 1 to 3. They come from
   // input pins 4 and 5. A step happens when the input is pressed.
@@ -429,6 +439,19 @@ module tt_um_cyberhuman_7segment (
   wire       su0, su1, su2, su3;  // the same chains from the undelayed EN (shown on CO)
   wire       sd0, sd1, sd2, sd3;
   wire       zero0, zero1, zero2, zero3;
+  wire       atb0, atb1, atb2, atb3;
+  wire       last0, last1, last2, last3;
+
+  // The second base of digit 2: while digit 3 is at the last digit of its base,
+  // digit 2 uses alt2 as its base (0 means no second base). Counting up that is
+  // judged on the count of digit 3 now. Counting down a wrap of digit 2 comes
+  // with a step of digit 3 on the same edge, so it is judged on digit 3 after
+  // the step: it is at the last digit then if it is 0 (it wraps to the last
+  // digit) or at its base (it steps to the last digit).
+  wire       alt2_on     = alt2 != 4'd0;
+  wire       last3_after = zero3 | atb3;
+  wire [3:0] base2_up    = (alt2_on & last3)       ? alt2 : base2;
+  wire [3:0] base2_dn    = (alt2_on & last3_after) ? alt2 : base2;
 
   // Four digits in two chains, each with its own base (16 after reset, so
   // together a 16-bit counter 0000..FFFF; bases 10, 6, 10, 6 make a clock
@@ -436,10 +459,10 @@ module tt_um_cyberhuman_7segment (
   // counts when the digit before it has a carry-out. The up chain (carry) and
   // the down chain (borrow) are both worked out all the time; each digit
   // picks its next count from them by the direction, as the last step.
-  digit digit0 (.clk(count_clk), .rst_n, .en_up(en_cnt),  .en_dn(en_cnt),  .en_up_s(en), .en_dn_s(en), .base(base0), .pick(pick_down), .down(count_down), .load(ld10), .value(ldata[3:0]), .seg(seg0), .co_up(cu0), .co_dn(cd0), .co_up_s(su0), .co_dn_s(sd0), .co(co0), .zero(zero0), .now(live10[3:0]));
-  digit digit1 (.clk(count_clk), .rst_n, .en_up(cu0), .en_dn(cd0), .en_up_s(su0), .en_dn_s(sd0), .base(base1), .pick(pick_down), .down(count_down), .load(ld10), .value(ldata[7:4]), .seg(seg1), .co_up(cu1), .co_dn(cd1), .co_up_s(su1), .co_dn_s(sd1), .co(co1), .zero(zero1), .now(live10[7:4]));
-  digit digit2 (.clk(count_clk), .rst_n, .en_up(cu1), .en_dn(cd1), .en_up_s(su1), .en_dn_s(sd1), .base(base2), .pick(pick_down), .down(count_down), .load(ld32), .value(ldata[3:0]), .seg(seg2), .co_up(cu2), .co_dn(cd2), .co_up_s(su2), .co_dn_s(sd2), .co(co2), .zero(zero2), .now(live32[3:0]));
-  digit digit3 (.clk(count_clk), .rst_n, .en_up(cu2), .en_dn(cd2), .en_up_s(su2), .en_dn_s(sd2), .base(base3), .pick(pick_down), .down(count_down), .load(ld32), .value(ldata[7:4]), .seg(seg3), .co_up(cu3), .co_dn(cd3), .co_up_s(su3), .co_dn_s(sd3), .co(co3), .zero(zero3), .now(live32[7:4]));
+  digit digit0 (.clk(count_clk), .rst_n, .en_up(en_cnt),  .en_dn(en_cnt),  .en_up_s(en), .en_dn_s(en), .base(base0), .base_dn(base0), .pick(pick_down), .down(count_down), .load(ld10), .value(ldata[3:0]), .seg(seg0), .co_up(cu0), .co_dn(cd0), .co_up_s(su0), .co_dn_s(sd0), .co(co0), .zero(zero0), .at_base(atb0), .last(last0), .now(live10[3:0]));
+  digit digit1 (.clk(count_clk), .rst_n, .en_up(cu0), .en_dn(cd0), .en_up_s(su0), .en_dn_s(sd0), .base(base1), .base_dn(base1), .pick(pick_down), .down(count_down), .load(ld10), .value(ldata[7:4]), .seg(seg1), .co_up(cu1), .co_dn(cd1), .co_up_s(su1), .co_dn_s(sd1), .co(co1), .zero(zero1), .at_base(atb1), .last(last1), .now(live10[7:4]));
+  digit digit2 (.clk(count_clk), .rst_n, .en_up(cu1), .en_dn(cd1), .en_up_s(su1), .en_dn_s(sd1), .base(base2_up), .base_dn(base2_dn), .pick(pick_down), .down(count_down), .load(ld32), .value(ldata[3:0]), .seg(seg2), .co_up(cu2), .co_dn(cd2), .co_up_s(su2), .co_dn_s(sd2), .co(co2), .zero(zero2), .at_base(atb2), .last(last2), .now(live32[3:0]));
+  digit digit3 (.clk(count_clk), .rst_n, .en_up(cu2), .en_dn(cd2), .en_up_s(su2), .en_dn_s(sd2), .base(base3), .base_dn(base3), .pick(pick_down), .down(count_down), .load(ld32), .value(ldata[7:4]), .seg(seg3), .co_up(cu3), .co_dn(cd3), .co_up_s(su3), .co_dn_s(sd3), .co(co3), .zero(zero3), .at_base(atb3), .last(last3), .now(live32[7:4]));
 
   // What each digit shows, by its 2-bit display mode (the segments only, CO
   // is not affected): 0 = the digit as is, 1 = the digit unless its own
