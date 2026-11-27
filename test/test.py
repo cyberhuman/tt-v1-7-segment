@@ -174,7 +174,7 @@ def shown(digit, co=0):
 def scan_index(dut):
     # The digit the chip shows in the modes 2 and 3, read from uio_out
     out = int(dut.uio_out.value)
-    if int(dut.uio_oe.value) == 0xF0:  # mode 3: one line per digit
+    if int(dut.uio_oe.value) & 0xF0 == 0xF0:  # mode 3: one line per digit
         assert (out >> 4) in (1, 2, 4, 8), f"uio_out {out:#x}"
         return [1, 2, 4, 8].index(out >> 4)
     return out >> 4 & 3  # mode 2: a number
@@ -182,9 +182,9 @@ def scan_index(dut):
 
 async def read_digits(dut, en=1):
     # Read all four digits (lowest first): by switching SEL, no clock edge
-    # needed; in the modes 2 and 3 (uio_oe not 0) by watching the scan for
+    # needed; in the modes 2 and 3 (uio_oe[7:4] not 0) by watching the scan for
     # four clock edges
-    if int(dut.uio_oe.value) != 0:
+    if int(dut.uio_oe.value) & 0xF0 != 0:
         drive(dut, en, 0)
         values = [None] * 4
         for _ in range(4):
@@ -534,7 +534,7 @@ async def step(dut, n=1):
 
 async def lit(dut, sel):
     # uo_out[6:0] of one digit
-    if int(dut.uio_oe.value) != 0:
+    if int(dut.uio_oe.value) & 0xF0 != 0:
         return (await read_digits(dut))[sel]
     drive(dut, 1, sel)
     await Timer(1, unit="us")
@@ -1635,14 +1635,14 @@ async def preset(dut, mode, values=(0x1, 0x2, 0x3, 0x4), dot=DOT_RESET, ctrl=0):
 @cocotb.test()
 async def test_scan_pins_in_each_mode(dut):
     await start(dut, 1)
-    for mode, oe in ((0, 0x00), (1, 0x00), (2, 0x30), (3, 0xF0)):
+    for mode, oe in ((0, 0x03), (1, 0x03), (2, 0x33), (3, 0xF3)):
         await set_mode(dut, mode)
         for oe_now, out, _ in await scan_trace(dut, 5):
             assert oe_now == oe, f"uio_oe in mode {mode}"
             if mode < 2:
-                assert out == 0, f"uio_out in mode {mode}"
+                assert out & 0xFC == 0, f"uio_out in mode {mode}"
             else:
-                assert out & 0x0F == 0, f"uio_out[3:0] in mode {mode}"
+                assert out & 0x0C == 0, f"uio_out[3:2] in mode {mode}"
                 if mode == 2:
                     assert out & 0xC0 == 0, "uio_out[7:6] in mode 2"
 
@@ -1654,7 +1654,7 @@ async def test_scan_mode2(dut):
     first = (trace[0][1] >> 4) & 3
     for i, (oe, out, uo) in enumerate(trace):
         want = (first + i) % 4
-        assert oe == 0x30 and out == want << 4, f"edge {i}: {out:#x}"
+        assert oe == 0x33 and out & 0xFC == want << 4, f"edge {i}: {out:#x}"
         assert uo == shown(want + 1), f"edge {i}: uo {uo:#x}"
     assert sorted({(t[1] >> 4) for t in trace}) == [0, 1, 2, 3]
 
@@ -1666,7 +1666,7 @@ async def test_scan_mode3(dut):
     first = [1, 2, 4, 8].index(trace[0][1] >> 4)
     for i, (oe, out, uo) in enumerate(trace):
         want = (first + i) % 4
-        assert oe == 0xF0 and out == (1 << want) << 4, f"edge {i}: {out:#x}"
+        assert oe == 0xF3 and out & 0xFC == (1 << want) << 4, f"edge {i}: {out:#x}"
         assert uo == shown(want + 1), f"edge {i}: uo {uo:#x}"
 
 
@@ -1706,7 +1706,7 @@ async def test_scan_holds_in_modes_0_1_and_continues(dut):
             await FallingEdge(dut.clk)
             s0 = scan_index(dut)
             await set_mode(dut, held_mode)  # the edge before the write still steps
-            assert int(dut.uio_oe.value) == 0 and int(dut.uio_out.value) == 0
+            assert int(dut.uio_oe.value) == 0x03 and int(dut.uio_out.value) & 0xFC == 0
             await ClockCycles(dut.clk, 7)
             await set_mode(dut, scan_mode)  # the edge before this write is held
             assert scan_index(dut) == (s0 + 1) % 4, f"{held_mode} -> {scan_mode}"
@@ -1734,7 +1734,7 @@ async def test_scan_with_inc_and_dec(dut):
         await check_digits(dut, [3, 0, 0, 0], f"INC, mode {mode}")
         await dec_pulses(dut, 1)
         await check_digits(dut, [2, 0, 0, 0], f"DEC, mode {mode}")
-        out = [t[1] for t in await scan_trace(dut, 4)]
+        out = [t[1] & 0xFC for t in await scan_trace(dut, 4)]
         assert len(set(out)) == 4, f"scan keeps running, mode {mode}"
 
 
@@ -1757,7 +1757,7 @@ async def test_scan_spi_write_while_scanning(dut):
         scan = [1, 2, 4, 8].index(out >> 4)
         assert uo & 0x7F == (0 if scan == 2 else PATTERNS[scan + 1]), f"digit {scan}"
     await spi_write(dut, BASE10, 0x00)
-    out = [t[1] for t in await scan_trace(dut, 4)]
+    out = [t[1] & 0xFC for t in await scan_trace(dut, 4)]
     assert len(set(out)) == 4
 
 
@@ -1767,14 +1767,121 @@ async def test_scan_reset(dut):
     await ClockCycles(dut.clk, 2)
     dut.rst_n.value = 0
     await Timer(1, unit="us")
-    assert int(dut.uio_oe.value) == 0, "uio_oe low in reset"
+    assert int(dut.uio_oe.value) == 0x03, "uio_oe in reset"
     await ClockCycles(dut.clk, 2)
     dut.rst_n.value = 1
     await FallingEdge(dut.clk)
-    assert int(dut.uio_oe.value) == 0 and int(dut.uio_out.value) == 0
+    assert int(dut.uio_oe.value) == 0x03 and int(dut.uio_out.value) & 0xFC == 0
     # Mode 2 again: the scan starts from 0
     await set_mode(dut, 2)
     first = int(dut.uio_out.value) >> 4 & 3
     assert first == 0, f"scan after reset, no edge yet in mode 2: {first}"
     await FallingEdge(dut.clk)
     assert scan_index(dut) == 1
+
+
+# CARRY (uio[1]) and BORROW (uio[0]): the carry-out and the borrow-out of the
+# whole counter, outputs in every count mode
+
+def carry_borrow(dut):
+    out = int(dut.uio_out.value)
+    assert int(dut.uio_oe.value) & 3 == 3, "uio[1:0] are outputs"
+    assert int(dut.uio_oe.value) & 0x0C == 0, "uio[3:2] are not outputs"
+    return out >> 1 & 1, out & 1
+
+
+def want_carry_borrow(digits, bases, en):
+    bases = [b or 16 for b in bases]
+    carry = en and all(d == b - 1 for d, b in zip(digits, bases))
+    borrow = en and all(d == 0 for d in digits)
+    return int(carry), int(borrow)
+
+
+async def load_digits(dut, digits):
+    # Load four digits in mode 0 (one clk edge), EN = 0
+    drive(dut, 0, 0)
+    await spi_write(dut, COUNT10, digits[1] << 4 | digits[0])
+    await spi_write(dut, COUNT32, digits[3] << 4 | digits[2])
+    await FallingEdge(dut.clk)
+    await FallingEdge(dut.clk)
+
+
+CB_CASES = [
+    ([0] * 4, [0, 0, 0, 0]),
+    ([15] * 4, [0, 0, 0, 0]),
+    ([15, 15, 15, 14], [0, 0, 0, 0]),
+    ([14, 15, 15, 15], [0, 0, 0, 0]),
+    ([1, 0, 0, 0], [0, 0, 0, 0]),
+    ([0, 0, 0, 1], [0, 0, 0, 0]),
+    ([9, 5, 9, 5], [10, 6, 10, 6]),
+    ([9, 5, 9, 4], [10, 6, 10, 6]),
+    ([0, 0, 0, 0], [10, 6, 10, 6]),
+    ([9, 15, 2, 5], [10, 0, 3, 6]),
+    ([9, 15, 2, 4], [10, 0, 3, 6]),
+    ([8, 15, 2, 5], [10, 0, 3, 6]),
+    ([15, 15, 15, 15], [10, 6, 10, 6]),  # above the bases: no carry
+]
+
+
+async def check_carry_borrow(dut, digits, bases, what):
+    # With EN = 1 and then 0, for each SEL; clk is not given an edge with EN = 1
+    await FallingEdge(dut.clk)
+    for en in (1, 0):
+        for sel in range(4):
+            drive(dut, en, sel)
+            await Timer(500, unit="ns")
+            assert carry_borrow(dut) == want_carry_borrow(digits, bases, en), \
+                f"{what}: digits {digits} bases {bases} EN {en} SEL {sel}"
+    drive(dut, 0, 0)
+
+
+@cocotb.test()
+async def test_carry_borrow_all_modes(dut):
+    for mode in range(4):
+        for ctrl in (0, DOWN):
+            for digits, bases in CB_CASES:
+                await start(dut, 0, base=bases)
+                await load_digits(dut, digits)
+                await set_mode(dut, mode, ctrl)
+                await check_carry_borrow(dut, digits, bases, f"mode {mode} ctrl {ctrl:#x}")
+
+
+@cocotb.test()
+async def test_carry_borrow_ignore_display_and_dot(dut):
+    # Display modes and dot values of the digits change what is shown, not the pins
+    for mode_reg, dot in ((0x00, DOT_RESET), (0x55, 0x00), (0xFF, 0xFF), (0xE4, 0x1B), (0xAA, 0x55)):
+        for digits in ([15] * 4, [0] * 4, [3, 0, 7, 1]):
+            await start(dut, 0, mode=mode_reg, dot=dot)
+            await load_digits(dut, digits)
+            await check_carry_borrow(dut, digits, [0] * 4, f"MODE {mode_reg:#x} DOT {dot:#x}")
+
+
+@cocotb.test()
+async def test_carry_borrow_follow_clk_count(dut):
+    # Mode 0: through the wrap 0xFFFF -> 0x0000 -> 0x0001
+    await start(dut, 0)
+    await load_digits(dut, [14, 15, 15, 15])
+    drive(dut, 1, 0)
+    for digits in ([15] * 4, [0] * 4, [1, 0, 0, 0]):
+        await FallingEdge(dut.clk)
+        await Timer(500, unit="ns")
+        assert carry_borrow(dut) == want_carry_borrow(digits, [0] * 4, 1), f"{digits}"
+    drive(dut, 0, 0)
+    await Timer(500, unit="ns")
+    assert carry_borrow(dut) == (0, 0)
+
+
+@cocotb.test()
+async def test_carry_borrow_follow_inc_count(dut):
+    for mode in (1, 2, 3):
+        await start(dut, 0)
+        await load_digits(dut, [14, 15, 15, 15])
+        await set_mode(dut, mode)
+        drive(dut, 1, 0)
+        for digits in ([15] * 4, [0] * 4, [1, 0, 0, 0]):
+            await press(dut, "I")
+            await Timer(SETTLE, unit="ns")
+            assert carry_borrow(dut) == want_carry_borrow(digits, [0] * 4, 1), f"mode {mode} {digits}"
+        drive(dut, 0, 0)
+        await Timer(500, unit="ns")
+        assert carry_borrow(dut) == (0, 0), f"mode {mode}, EN 0"

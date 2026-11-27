@@ -434,13 +434,18 @@ module tt_um_cyberhuman_7segment (
 
   // The digit select goes out on the bidirectional pins. Mode 2: the scan
   // number on uio[5:4]. Mode 3: one active-high line per digit on uio[7:4]
-  // (uio[4] is digit 0). In the modes 0 and 1 nothing is driven. uio[3:0]
-  // are never outputs.
+  // (uio[4] is digit 0). In the modes 0 and 1 nothing is driven there.
+  // uio[1] is CARRY and uio[0] is BORROW in every count mode: the carry-out
+  // and the borrow-out of the whole counter, taken from the chains of the
+  // undelayed EN (the ones that CO and the dot show). uio[2] is kept for
+  // MISO and uio[3] is unused, neither is an output.
   wire mode2 = count_mode == 2'd2;
   wire mode3 = count_mode == 2'd3;
   wire [3:0] one_hot = 4'b0001 << scan;
-  assign uio_out = mode3 ? {one_hot, 4'b0000} : mode2 ? {2'b00, scan, 4'b0000} : 8'h00;
-  assign uio_oe  = mode3 ? 8'hF0 : mode2 ? 8'h30 : 8'h00;
+  wire carry  = su3;
+  wire borrow = sd3;
+  assign uio_out = {mode3 ? {one_hot, 4'b0000} : mode2 ? {2'b00, scan, 4'b0000} : 8'h00} | {6'b0, carry, borrow};
+  assign uio_oe  = mode3 ? 8'hF3 : mode2 ? 8'h33 : 8'h03;
 
   // List all unused inputs to prevent warnings
   wire _unused = &{ena, uio_in[7:6], uio_in[3:0], ui_in[7:6], 1'b0};

@@ -33,6 +33,11 @@ carry-out of the digit or its inverse. The display shows one digit at a time.
   once, without a clock edge. In the modes 2 and 3 the chip picks the digit
   itself and these pins, with `uio[6]` and `uio[7]`, are outputs: **DIG0** to
   **DIG3** (below).
+- `uio[1]` is **CARRY** and `uio[0]` is **BORROW**, outputs in every count
+  mode. CARRY is the carry-out of the whole counter: high while EN = 1 and all
+  four digits are at the last digit of their base. BORROW is the borrow-out of
+  the whole counter: high while EN = 1 and all four digits are 0. Both follow
+  the count whatever the direction, the digit shown and the display mode.
 - `uo[0]` to `uo[6]` drive the segments A to G (active high) of the digit shown.
 - `uo[7]` is **DP**, the decimal point of the digit shown. Its DOT value
   (below) makes it off, on, the carry-out CO of that digit, or the inverse of
@@ -146,6 +151,8 @@ watch them one by one.
 | ui[3] | EN | in | count enable (carry-in) |
 | ui[4] | INC | in | counts up on press, count modes 1 to 3 |
 | ui[5] | DEC | in | counts down on press, count modes 1 to 3 |
+| uio[0] | BORROW | out | borrow-out of the whole counter |
+| uio[1] | CARRY | out | carry-out of the whole counter |
 | uio[4] | SEL0 / DIG0 | in / out | digit select low bit (modes 0, 1); scan number low bit (mode 2) or digit 0 line (mode 3) |
 | uio[5] | SEL1 / DIG1 | in / out | digit select high bit (modes 0, 1); scan number high bit (mode 2) or digit 1 line (mode 3) |
 | uio[6] | DIG2 | out | digit 2 line, mode 3 only |
@@ -160,7 +167,7 @@ watch them one by one.
 | uo[7] | DP | out | decimal point of the digit shown (CO by default) |
 
 Clock and reset are the dedicated `clk` and `rst_n` pins. The other `ui` pins
-and `uio[0]`, `uio[1]` and `uio[3]` are unused; `uio[2]` is kept for MISO and is not driven.
+and `uio[3]` are unused; `uio[2]` is kept for MISO and is not driven.
 
 ## How to test
 
@@ -184,7 +191,8 @@ and `uio[0]`, `uio[1]` and `uio[3]` are unused; `uio[2]` is kept for MISO and is
 A 7-segment display on `uo[0]` to `uo[7]` (active high), switches for EN
 (`ui[3]`), push buttons for INC and DEC (`ui[4]`, `ui[5]`) and SEL (`uio[4]`, `uio[5]`; outputs in the modes 2 and 3), an SPI controller (for example the
 RP2040 on the demo board) on `ui[0]`, `ui[1]` and `ui[2]`, and a slow clock
-source or a push button on `clk`.
+source or a push button on `clk`. CARRY and BORROW (`uio[1]`, `uio[0]`) can
+enable a further counter.
 
 For a four-digit multiplexed display, set the mode to 2 or 3 and put the four
 digits' segment pins in parallel on `uo[0]` to `uo[7]`. Mode 2: a 2-to-4

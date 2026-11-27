@@ -37,8 +37,8 @@ pinout:
   uo[7]: "DP"
 
   # Bidirectional pins
-  uio[0]: ""
-  uio[1]: ""
+  uio[0]: "BORROW"
+  uio[1]: "CARRY"
   uio[2]: ""
   uio[3]: ""
   uio[4]: "SEL0 / DIG0"
