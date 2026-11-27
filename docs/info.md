@@ -26,6 +26,7 @@ count are set over SPI.
 | `ui[5]` | DEC | in | counts down when pressed (count modes 1 to 3) |
 | `uio[0]` | BORROW | out | borrow-out of the whole counter |
 | `uio[1]` | CARRY | out | carry-out of the whole counter |
+| `uio[2]` | MISO | out | SPI data out |
 | `uio[4]` | SEL0 / DIG0 | in / out | digit select, low bit (modes 0, 1); scan number, low bit (mode 2); digit 0 line (mode 3) |
 | `uio[5]` | SEL1 / DIG1 | in / out | digit select, high bit (modes 0, 1); scan number, high bit (mode 2); digit 1 line (mode 3) |
 | `uio[6]` | DIG2 | out | digit 2 line (mode 3) |
@@ -35,8 +36,7 @@ count are set over SPI.
 | `clk` | | in | counts (mode 0) or steps the scan (modes 2, 3) |
 | `rst_n` | | in | reset, active low |
 
-`ui[6]`, `ui[7]` and `uio[3]` are unused; `uio[2]` is kept for MISO and is not
-driven.
+`ui[6]`, `ui[7]` and `uio[3]` are unused.
 
 ### Counting
 
@@ -77,23 +77,30 @@ only; neither affects the counting.
 
 ### Registers
 
-CS, MOSI and SCK are an SPI port (mode 0, MSB first) that writes registers. A
-write is 16 bits: an address byte, then a data byte. The register takes the
-data on the 16th clock edge, and more writes can follow while CS stays low. A
-write cut short by CS going high changes nothing, and so do SCK edges while CS
-is high. Bit 7 of the address is reserved for reads, so a write with it set
-changes nothing, and neither does an address without a register. There is no
-MISO yet, so registers cannot be read back.
+CS, MOSI, SCK and MISO are an SPI port (mode 0, MSB first) that writes and
+reads registers. A write is 16 bits: an address byte, then a data byte. The
+register takes the data on the 16th clock edge, and more writes and reads can
+follow while CS stays low. A write cut short by CS going high changes nothing,
+and so do SCK edges while CS is high. A write to an address without a register
+changes nothing.
 
-| Address | Register | Reset | Data bits |
-|---------|----------|-------|-----------|
-| 0x00 | BASE10 | 0x00 | 7:4 base of digit 1, 3:0 base of digit 0 (0 means 16) |
-| 0x01 | BASE32 | 0x00 | 7:4 base of digit 3, 3:0 base of digit 2 (0 means 16) |
-| 0x02 | MODE | 0x00 | 7:6 mode of digit 3, 5:4 digit 2, 3:2 digit 1, 1:0 digit 0 |
-| 0x03 | DOT | 0xAA | 7:6 dot of digit 3, 5:4 digit 2, 3:2 digit 1, 1:0 digit 0 |
-| 0x04 | CTRL | 0x00 | 7:3 unused; 2 UP/DOWN (0 counts up, 1 counts down); 1:0 count mode |
-| 0x05 | COUNT10 | 0x00 | 7:4 count of digit 1, 3:0 count of digit 0 |
-| 0x06 | COUNT32 | 0x00 | 7:4 count of digit 3, 3:0 count of digit 2 |
+A read is also 16 clocks: the address byte with bit 7 set (0x80 | address),
+then 8 clocks in which the chip sends the byte on MISO, bit 7 first. MISO
+changes on the falling edge of SCK and is valid at the 9th to the 16th rising
+edge; MOSI is ignored in those 8 clocks. The byte is taken on the 8th rising
+edge, when the address is complete. A read writes nothing, and one cut short by
+CS going high changes nothing. An address without a register reads 0. MISO is
+driven while CS is low and is 0 except in the data byte of a read.
+
+| Address | Register | Reset | Reads | Data bits |
+|---------|----------|-------|-------|-----------|
+| 0x00 | BASE10 | 0x00 | the register | 7:4 base of digit 1, 3:0 base of digit 0 (0 means 16) |
+| 0x01 | BASE32 | 0x00 | the register | 7:4 base of digit 3, 3:0 base of digit 2 (0 means 16) |
+| 0x02 | MODE | 0x00 | the register | 7:6 mode of digit 3, 5:4 digit 2, 3:2 digit 1, 1:0 digit 0 |
+| 0x03 | DOT | 0xAA | the register | 7:6 dot of digit 3, 5:4 digit 2, 3:2 digit 1, 1:0 digit 0 |
+| 0x04 | CTRL | 0x00 | the register | 7:3 unused (read 0); 2 UP/DOWN (0 counts up, 1 counts down); 1:0 count mode |
+| 0x05 | COUNT10 | 0x00 | the count now | 7:4 count of digit 1, 3:0 count of digit 0 |
+| 0x06 | COUNT32 | 0x00 | the count now | 7:4 count of digit 3, 3:0 count of digit 2 |
 
 A write to COUNT10 or COUNT32 sets the count. It is taken on the next step
 (the rising edge of `clk` in mode 0, a press of INC or DEC in the other
@@ -101,7 +108,8 @@ modes), which loads those two digits instead of counting, whatever EN and the
 direction are. Writing the same value again loads again, and writing both
 registers before one step loads all four digits on that step. A digit that
 loads has no carry-out on that step, and a value at or above the base is taken
-as is.
+as is. A read of COUNT10 or COUNT32 returns the count the digits hold now, not
+the value written.
 
 ### Display mode (MODE, two bits per digit)
 
@@ -149,6 +157,8 @@ table.
 - The SPI side has its own clock, SCK, with no synchroniser to `clk`, INC or
   DEC. Write registers between steps of the counter, not at the moment of one.
   The scan counter takes the count mode the same way.
+- The count is read without a synchroniser too: read COUNT10 and COUNT32
+  between steps of the counter.
 - A change on SEL shows at once, without a clock edge.
 - The counts are held in flip-flops and the segments are decoded from them, so
   all segments change together after a step.
@@ -185,7 +195,7 @@ table.
 
 A 7-segment display on `uo[0]` to `uo[7]` (active high), switches for EN
 (`ui[3]`), push buttons for INC and DEC (`ui[4]`, `ui[5]`) and SEL (`uio[4]`, `uio[5]`; outputs in the modes 2 and 3), an SPI controller (for example the
-RP2040 on the demo board) on `ui[0]`, `ui[1]` and `ui[2]`, and a slow clock
+RP2040 on the demo board) on `ui[0]`, `ui[1]`, `ui[2]` and `uio[2]` (MISO), and a slow clock
 source or a push button on `clk`. CARRY and BORROW (`uio[1]`, `uio[0]`) can
 enable a further counter.
 

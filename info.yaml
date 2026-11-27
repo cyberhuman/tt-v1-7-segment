@@ -39,7 +39,7 @@ pinout:
   # Bidirectional pins
   uio[0]: "BORROW"
   uio[1]: "CARRY"
-  uio[2]: ""
+  uio[2]: "MISO"
   uio[3]: ""
   uio[4]: "SEL0 / DIG0"
   uio[5]: "SEL1 / DIG1"

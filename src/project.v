@@ -82,7 +82,8 @@ module digit (
     output wire       co_up_s, // carry-out of the shown up chain (from en_up_s)
     output wire       co_dn_s, // borrow-out of the shown down chain (from en_dn_s)
     output wire       co,     // carry-out of the chain that `down` chooses
-    output wire       zero    // the count is 0
+    output wire       zero,   // the count is 0
+    output wire [3:0] now     // the count
 );
 
   // The 4-bit counter is held in flip-flops, the segments are decoded from it
@@ -159,21 +160,29 @@ module digit (
 
   // The count is 0 (used by display mode 1 and by counting down)
   assign zero = count == 4'd0;
+  assign now  = count;
 
 endmodule
 
-// The settings: registers written over SPI (mode 0, MSB first). A write is 16
-// bits: an address byte, then a data byte. On the 16th rising SCK edge the
-// register at that address takes the data. Several writes can follow each
-// other while CS stays low. A write cut short by CS going high changes
-// nothing. Bit 7 of the address is reserved for reads: a write with it set
-// changes nothing, and so does an address without a register.
+// The settings: registers written and read over SPI (mode 0, MSB first). A
+// write is 16 bits: an address byte, then a data byte. On the 16th rising SCK
+// edge the register at that address takes the data. A read is also 16 bits:
+// an address byte with bit 7 set, then 8 clocks in which the chip sends the
+// byte on MISO (changing on the falling edge, so valid at the 9th to 16th
+// rising edges; MOSI is ignored then). The byte is taken at the 8th rising
+// edge. MISO is 0 outside the data byte of a read. Several writes and reads
+// can follow each other while CS stays low. A write or read cut short by CS
+// going high changes nothing, and so does a write to an address without a
+// register. A read changes nothing and an address without a register reads 0.
 // Everything here is clocked by SCK, not by clk.
 module settings (
     input  wire       sck,    // SPI clock
     input  wire       cs_n,   // SPI chip select, low while a write is sent
     input  wire       mosi,   // SPI data in
     input  wire       rst_n,  // reset_n - low to reset
+    input  wire [7:0] live10, // the running count of digits 1 and 0 (digit 1 in bits 7:4)
+    input  wire [7:0] live32, // the running count of digits 3 and 2
+    output reg        miso,   // SPI data out, driven only while CS is low
     output reg  [7:0] mode,   // display mode of each digit, 2 bits each, digit 0 in bits 1:0
     output reg  [7:0] dot,    // what bit 7 shows for each digit, 2 bits each, digit 0 in bits 1:0
     output reg        down,   // count direction of all digits: 0 up, 1 down
@@ -197,29 +206,63 @@ module settings (
   localparam [6:0] ADDR_COUNT10 = 7'h05;  // {count1, count0}, loaded on the next clock edge
   localparam [6:0] ADDR_COUNT32 = 7'h06;  // {count3, count2}, loaded on the next clock edge
 
-  // The bits received so far in this write, newest in bit 0
+  // The bits received so far in this transfer, newest in bit 0. In a read
+  // the byte to send replaces them at the 8th edge and moves up from there.
   reg [14:0] shift;
 
-  // How many bits of this write have been received (0..15)
+  // How many bits of this transfer have been received (0..15)
   reg [3:0] bit_count;
 
-  // The write is complete when the 16th bit arrives: 15 bits are already in
-  // the shift register, and the bit on MOSI is the last one.
-  // The counter is held at 0 while CS is high, so a cut-short write is dropped.
-  // It is 4 bits wide, so after the 16th bit it wraps to 0 and the next
-  // write can follow.
+  // This transfer is a read (set at the 8th edge, cleared at the 16th)
+  reg reading;
+
+  // The byte that an address reads: the register, or for the two count
+  // addresses the running count of the digits (not the written value)
+  function [7:0] read_byte(input [6:0] a);
+    case (a)
+      ADDR_BASE10:  read_byte = {base1, base0};
+      ADDR_BASE32:  read_byte = {base3, base2};
+      ADDR_MODE:    read_byte = mode;
+      ADDR_DOT:     read_byte = dot;
+      ADDR_CTRL:    read_byte = {5'd0, down, count_mode};
+      ADDR_COUNT10: read_byte = live10;
+      ADDR_COUNT32: read_byte = live32;
+      default:      read_byte = 8'd0;
+    endcase
+  endfunction
+
+  // At the 8th bit the address is complete: 7 bits are in the shift register
+  // and the bit on MOSI is the last one. With the read bit set the byte is
+  // taken here. In a write the 16th bit completes the data byte: 15 bits are
+  // already in the shift register, and the bit on MOSI is the last one.
+  // The counter is held at 0 while CS is high, so a cut-short transfer is
+  // dropped. It is 4 bits wide, so after the 16th bit it wraps to 0 and the
+  // next transfer can follow.
   always @(posedge sck or posedge cs_n) begin
     if (cs_n) begin
       bit_count <= 4'd0;
+      reading   <= 1'b0;
     end else begin
       bit_count <= bit_count + 4'd1;
-      shift     <= {shift[13:0], mosi};
+      if (bit_count == 4'd7 && shift[6]) begin
+        shift   <= {read_byte({shift[5:0], mosi}), 7'd0};
+        reading <= 1'b1;
+      end else begin
+        shift   <= {shift[13:0], mosi};
+      end
+      if (bit_count == 4'd15) reading <= 1'b0;
     end
+  end
+
+  // MISO: the top bit of the byte on the falling edge, so it is stable at the
+  // next rising edge. 0 when no byte is being sent.
+  always @(negedge sck or posedge cs_n) begin
+    if (cs_n) miso <= 1'b0;
+    else      miso <= reading & shift[14];
   end
 
   // The complete write: the address byte, then the data byte
   wire [15:0] word = {shift, mosi};
-  wire        read_bit = word[15];
   wire [6:0]  addr = word[14:8];
   wire [7:0]  data = word[7:0];
 
@@ -239,7 +282,7 @@ module settings (
       base1 <= 4'd0;
       base2 <= 4'd0;
       base3 <= 4'd0;
-    end else if (!cs_n && bit_count == 4'd15 && !read_bit) begin
+    end else if (!cs_n && bit_count == 4'd15 && !reading) begin
       case (addr)
         ADDR_BASE10: {base1, base0} <= data;
         ADDR_BASE32: {base3, base2} <= data;
@@ -280,7 +323,7 @@ module tt_um_cyberhuman_7segment (
   wire [1:0] sel_pin = uio_in[5:4];
 
   // SPI pins: ui[0] is CS (active low), ui[1] is MOSI, ui[2] is SCK.
-  // uio[2] is kept for MISO, it is not driven.
+  // uio[2] is MISO, driven while CS is low.
   wire cs_n = ui_in[0];
   wire mosi = ui_in[1];
   wire sck  = ui_in[2];
@@ -294,8 +337,10 @@ module tt_um_cyberhuman_7segment (
   wire [1:0] count_mode;
   wire [3:0] base0, base1, base2, base3;
   wire [7:0] count10, count32;
+  wire [7:0] live10, live32;
+  wire       miso;
   wire       tgl10, tgl32;
-  settings settings0 (.sck, .cs_n, .mosi, .rst_n, .mode, .dot, .down, .count_mode, .count10, .count32,
+  settings settings0 (.sck, .cs_n, .mosi, .rst_n, .live10, .live32, .miso, .mode, .dot, .down, .count_mode, .count10, .count32,
                       .tgl10, .tgl32, .base0, .base1, .base2, .base3);
 
   // INC counts up and DEC counts down in the modes 1 to 3. They come from
@@ -368,10 +413,10 @@ module tt_um_cyberhuman_7segment (
   // counts when the digit before it has a carry-out. The up chain (carry) and
   // the down chain (borrow) are both worked out all the time; each digit
   // picks its next count from them by the direction, as the last step.
-  digit digit0 (.clk(count_clk), .rst_n, .en_up(en_cnt),  .en_dn(en_cnt),  .en_up_s(en), .en_dn_s(en), .base(base0), .pick(pick_down), .down(count_down), .load(load10), .value(count10[3:0]), .seg(seg0), .co_up(cu0), .co_dn(cd0), .co_up_s(su0), .co_dn_s(sd0), .co(co0), .zero(zero0));
-  digit digit1 (.clk(count_clk), .rst_n, .en_up(cu0), .en_dn(cd0), .en_up_s(su0), .en_dn_s(sd0), .base(base1), .pick(pick_down), .down(count_down), .load(load10), .value(count10[7:4]), .seg(seg1), .co_up(cu1), .co_dn(cd1), .co_up_s(su1), .co_dn_s(sd1), .co(co1), .zero(zero1));
-  digit digit2 (.clk(count_clk), .rst_n, .en_up(cu1), .en_dn(cd1), .en_up_s(su1), .en_dn_s(sd1), .base(base2), .pick(pick_down), .down(count_down), .load(load32), .value(count32[3:0]), .seg(seg2), .co_up(cu2), .co_dn(cd2), .co_up_s(su2), .co_dn_s(sd2), .co(co2), .zero(zero2));
-  digit digit3 (.clk(count_clk), .rst_n, .en_up(cu2), .en_dn(cd2), .en_up_s(su2), .en_dn_s(sd2), .base(base3), .pick(pick_down), .down(count_down), .load(load32), .value(count32[7:4]), .seg(seg3), .co_up(cu3), .co_dn(cd3), .co_up_s(su3), .co_dn_s(sd3), .co(co3), .zero(zero3));
+  digit digit0 (.clk(count_clk), .rst_n, .en_up(en_cnt),  .en_dn(en_cnt),  .en_up_s(en), .en_dn_s(en), .base(base0), .pick(pick_down), .down(count_down), .load(load10), .value(count10[3:0]), .seg(seg0), .co_up(cu0), .co_dn(cd0), .co_up_s(su0), .co_dn_s(sd0), .co(co0), .zero(zero0), .now(live10[3:0]));
+  digit digit1 (.clk(count_clk), .rst_n, .en_up(cu0), .en_dn(cd0), .en_up_s(su0), .en_dn_s(sd0), .base(base1), .pick(pick_down), .down(count_down), .load(load10), .value(count10[7:4]), .seg(seg1), .co_up(cu1), .co_dn(cd1), .co_up_s(su1), .co_dn_s(sd1), .co(co1), .zero(zero1), .now(live10[7:4]));
+  digit digit2 (.clk(count_clk), .rst_n, .en_up(cu1), .en_dn(cd1), .en_up_s(su1), .en_dn_s(sd1), .base(base2), .pick(pick_down), .down(count_down), .load(load32), .value(count32[3:0]), .seg(seg2), .co_up(cu2), .co_dn(cd2), .co_up_s(su2), .co_dn_s(sd2), .co(co2), .zero(zero2), .now(live32[3:0]));
+  digit digit3 (.clk(count_clk), .rst_n, .en_up(cu2), .en_dn(cd2), .en_up_s(su2), .en_dn_s(sd2), .base(base3), .pick(pick_down), .down(count_down), .load(load32), .value(count32[7:4]), .seg(seg3), .co_up(cu3), .co_dn(cd3), .co_up_s(su3), .co_dn_s(sd3), .co(co3), .zero(zero3), .now(live32[7:4]));
 
   // What each digit shows, by its 2-bit display mode (the segments only, CO
   // is not affected): 0 = the digit as is, 1 = the digit unless its own
@@ -437,15 +482,15 @@ module tt_um_cyberhuman_7segment (
   // (uio[4] is digit 0). In the modes 0 and 1 nothing is driven there.
   // uio[1] is CARRY and uio[0] is BORROW in every count mode: the carry-out
   // and the borrow-out of the whole counter, taken from the chains of the
-  // undelayed EN (the ones that CO and the dot show). uio[2] is kept for
-  // MISO and uio[3] is unused, neither is an output.
+  // undelayed EN (the ones that CO and the dot show). uio[2] is
+  // MISO, an output only while CS is low, and uio[3] is unused.
   wire mode2 = count_mode == 2'd2;
   wire mode3 = count_mode == 2'd3;
   wire [3:0] one_hot = 4'b0001 << scan;
   wire carry  = su3;
   wire borrow = sd3;
-  assign uio_out = {mode3 ? {one_hot, 4'b0000} : mode2 ? {2'b00, scan, 4'b0000} : 8'h00} | {6'b0, carry, borrow};
-  assign uio_oe  = mode3 ? 8'hF3 : mode2 ? 8'h33 : 8'h03;
+  assign uio_out = {mode3 ? {one_hot, 4'b0000} : mode2 ? {2'b00, scan, 4'b0000} : 8'h00} | {5'b0, miso, carry, borrow};
+  assign uio_oe  = (mode3 ? 8'hF3 : mode2 ? 8'h33 : 8'h03) | {5'b0, ~cs_n, 2'b0};
 
   // List all unused inputs to prevent warnings
   wire _unused = &{ena, uio_in[7:6], uio_in[3:0], ui_in[7:6], 1'b0};

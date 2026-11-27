@@ -72,6 +72,9 @@ set_output_delay $output_delay_value -clock $clocks [all_outputs]
 set sck_delay_value [expr 100 * $::env(IO_DELAY_CONSTRAINT) / 100]
 set_input_delay $sck_delay_value -clock [get_clocks sck] [get_ports {ui_in[0] ui_in[1]}]
 
+# MISO leaves on the falling edge of SCK and the controller samples it on the rising edge
+set_output_delay $sck_delay_value -clock [get_clocks sck] -add_delay [get_ports {uio_out[2]}]
+
 # The counter is clocked when INC or DEC rises (the press), through a delay line,
 # so the delays against inc and dec are referenced to the rising edge.
 # EN also gates the counter when INC clocks it, so it is timed against inc too,

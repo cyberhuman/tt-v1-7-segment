@@ -1288,6 +1288,8 @@ async def test_dec_mode1_counts_down_on_press(dut):
     await check_digits(dut, [0, 15, 15, 15], "down to FFF0")
     await dec_pulses(dut, 1)
     await check_digits(dut, [15, 14, 15, 15], "borrow into digit 1")
+    # The live count over SPI follows the DEC steps
+    assert await read_all_counts(dut) == (0xEF, 0xFF)
 
 
 # Skipped in the gate level run without delays: presses DEC, and that race needs the gate delays.
@@ -1885,3 +1887,275 @@ async def test_carry_borrow_follow_inc_count(dut):
         drive(dut, 0, 0)
         await Timer(500, unit="ns")
         assert carry_borrow(dut) == (0, 0), f"mode {mode}, EN 0"
+
+
+# Reads over MISO (uio[2]): an address byte with bit 7 set, then 8 clocks in
+# which the chip sends the byte, MSB first. MISO changes on the falling edge
+# of SCK, is valid at the rising edges, is 0 outside the data byte, and is
+# driven only while CS is low.
+
+MISO_BIT = 0x04
+JUNK = 0x5A  # what MOSI carries during the data byte of a read: ignored
+
+
+def miso(dut):
+    return int(dut.uio_out.value) >> 2 & 1
+
+
+async def spi_clock_miso(dut, word, bits):
+    # Send the top `bits` bits of a 16-bit word (CS already low) and return
+    # the MISO level at each rising edge. MISO must not change after the
+    # rising edge, until the falling edge.
+    levels = []
+    for i in range(bits):
+        bit = (word >> (15 - i)) & 1
+        uio_set(dut, bit * MOSI)
+        await Timer(SPI_HALF, unit="ns")
+        level = miso(dut)
+        uio_set(dut, bit * MOSI | SCK)
+        await Timer(10, unit="ns")
+        assert miso(dut) == level, f"MISO changed after the rising edge {i + 1}"
+        await Timer(SPI_HALF - 10, unit="ns")
+        assert miso(dut) == level, f"MISO changed before the falling edge {i + 1}"
+        uio_set(dut, bit * MOSI)
+        levels.append(level)
+    return levels
+
+
+def byte_of(levels):
+    # The byte sent in the data cycles (9th to 16th edge); the first 8 levels must be 0
+    assert levels[:8] == [0] * 8, f"MISO outside the data byte: {levels}"
+    value = 0
+    for level in levels[8:]:
+        value = value << 1 | level
+    return value
+
+
+async def spi_xfers(dut, *ops, last_bits=16):
+    # Several transfers in one CS-low period: ("w", address, value) or
+    # ("r", address). `last_bits` cuts the last one short. Returns the MISO
+    # levels of each transfer.
+    uio_set(dut, 0)
+    await Timer(SPI_HALF, unit="ns")
+    result = []
+    for n, op in enumerate(ops):
+        bits = last_bits if n == len(ops) - 1 else 16
+        if op[0] == "w":
+            word = op[1] << 8 | op[2]
+        else:
+            word = (0x80 | op[1]) << 8 | JUNK
+        result.append(await spi_clock_miso(dut, word, bits))
+    await Timer(SPI_HALF, unit="ns")
+    uio_set(dut, CS)
+    await Timer(SPI_HALF, unit="ns")
+    return result
+
+
+async def spi_read(dut, address):
+    # One read with its own CS pulse; returns the byte
+    return byte_of((await spi_xfers(dut, ("r", address)))[0])
+
+
+async def read_all(dut):
+    # The registers 0x00 to 0x06
+    return [await spi_read(dut, a) for a in range(7)]
+
+
+REG_VALUES = {BASE10: 0xA3, BASE32: 0x5C, MODE: 0xE4, DOT: 0x1B, CTRL: 0x05}
+
+
+@cocotb.test()
+async def test_read_each_register_after_write(dut):
+    await start(dut, 0)
+    drive(dut, 0, 0)
+    for address, value in REG_VALUES.items():
+        await spi_write(dut, address, value)
+        assert await spi_read(dut, address) == value, f"register {address:#x}"
+    # All of them still hold their own value
+    for address, value in REG_VALUES.items():
+        assert await spi_read(dut, address) == value, f"register {address:#x} later"
+    # CTRL has 3 bits: the others read 0
+    await spi_write(dut, CTRL, 0xFF)
+    assert await spi_read(dut, CTRL) == 0x07
+    await spi_write(dut, CTRL, 0xF8)
+    assert await spi_read(dut, CTRL) == 0x00
+
+
+@cocotb.test()
+async def test_read_after_reset(dut):
+    await start(dut, 0)
+    assert await read_all(dut) == [0, 0, 0, DOT_RESET, 0, 0, 0]
+    for address, value in REG_VALUES.items():
+        await spi_write(dut, address, value)
+    dut.rst_n.value = 0
+    await ClockCycles(dut.clk, 3)
+    dut.rst_n.value = 1
+    await FallingEdge(dut.clk)
+    assert await read_all(dut) == [0, 0, 0, DOT_RESET, 0, 0, 0]
+
+
+@cocotb.test()
+async def test_read_count_mode0_is_live(dut):
+    await start(dut, 0, base=[10, 6, 10, 6])
+    assert await spi_read(dut, COUNT10) == 0x00
+    await load_digits(dut, [8, 5, 9, 5])
+    # The running count, not the written value: 0x58 and 0x59 now, 0x59 and 0x59
+    # after one step, 0x00 and 0x00 after the second (the carry runs through)
+    for count10, count32 in ((0x58, 0x59), (0x59, 0x59), (0x00, 0x00)):
+        assert await spi_read(dut, COUNT10) == count10
+        assert await spi_read(dut, COUNT32) == count32
+        await FallingEdge(dut.clk)
+        await step(dut, 1)
+        drive(dut, 0, 0)
+    # The registers are not the count: the bases are still there
+    assert await spi_read(dut, BASE10) == 0x6A
+    assert await spi_read(dut, BASE32) == 0x6A
+
+
+async def check_live_pin_mode(dut, mode):
+    await start_mode(dut, mode, base=[10, 6, 10, 6])
+    await spi_write(dut, COUNT10, 0x58)
+    await spi_write(dut, COUNT32, 0x59)
+    # Written, not loaded yet
+    assert await read_all_counts(dut) == (0x00, 0x00), f"mode {mode} before the load"
+    await inc_pulses(dut, 1, en=0)
+    await Timer(SETTLE, unit="ns")
+    assert await read_all_counts(dut) == (0x58, 0x59), f"mode {mode} after the load"
+    for want in ((0x59, 0x59), (0x00, 0x00)):
+        await inc_pulses(dut, 1)
+        await Timer(SETTLE, unit="ns")
+        assert await read_all_counts(dut) == want, f"mode {mode} after a step"
+
+
+async def read_all_counts(dut):
+    return await spi_read(dut, COUNT10), await spi_read(dut, COUNT32)
+
+
+@cocotb.test()
+async def test_read_count_pin_modes_are_live(dut):
+    for mode in (1, 2, 3):
+        await check_live_pin_mode(dut, mode)
+
+
+@cocotb.test()
+async def test_read_unknown_address_is_zero(dut):
+    await start(dut, 0)
+    drive(dut, 0, 0)
+    for address, value in REG_VALUES.items():
+        await spi_write(dut, address, value)
+    for address in (0x07, 0x08, 0x10, 0x20, 0x3F, 0x40, 0x41, 0x42, 0x43, 0x44, 0x45, 0x46, 0x7F):
+        assert await spi_read(dut, address) == 0, f"address {address:#x}"
+
+
+@cocotb.test()
+async def test_read_changes_nothing(dut):
+    await start(dut, 0, base=[10, 6, 10, 6], mode=0xE4, dot=0x1B)
+    await load_digits(dut, [8, 5, 9, 5])
+    before = await read_all(dut)
+    assert before == [0x6A, 0x6A, 0xE4, 0x1B, 0x00, 0x58, 0x59]
+    for _ in range(2):
+        for address in (0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x7F):
+            await spi_read(dut, address)
+    assert await read_all(dut) == before
+    # The count was not loaded again by the reads: it goes on from 0x5958
+    await FallingEdge(dut.clk)
+    await step(dut, 1)
+    drive(dut, 0, 0)
+    assert await read_all_counts(dut) == (0x59, 0x59)
+    # Nor does the dot, mode or base change: the display still agrees
+    assert await read_all(dut) == [0x6A, 0x6A, 0xE4, 0x1B, 0x00, 0x59, 0x59]
+
+
+@cocotb.test()
+async def test_read_changes_nothing_in_pin_mode(dut):
+    await start_mode(dut, 1, base=[10, 6, 10, 6])
+    await spi_write(dut, COUNT10, 0x58)
+    await spi_write(dut, COUNT32, 0x59)
+    # Reads of the count registers are not writes: no load on the press
+    for _ in range(3):
+        await read_all(dut)
+    await inc_pulses(dut, 1, en=0)
+    await Timer(SETTLE, unit="ns")
+    assert await read_all_counts(dut) == (0x58, 0x59)
+
+
+@cocotb.test()
+async def test_write_and_read_in_one_cs_low(dut):
+    await start(dut, 0)
+    drive(dut, 0, 0)
+    got = await spi_xfers(dut,
+                          ("w", BASE10, 0x23), ("r", BASE10), ("w", MODE, 0x1B), ("r", MODE),
+                          ("r", DOT), ("w", DOT, 0x55), ("r", DOT), ("r", BASE32), ("r", BASE10))
+    assert [byte_of(g) for g in got[1:2] + got[3:5] + got[6:]] == [0x23, 0x1B, DOT_RESET, 0x55, 0x00, 0x23]
+    # The writes before and after the reads took effect
+    assert await read_all(dut) == [0x23, 0x00, 0x1B, 0x55, 0x00, 0x00, 0x00]
+
+
+@cocotb.test()
+async def test_miso_zero_during_write(dut):
+    await start(dut, 0)
+    drive(dut, 0, 0)
+    await spi_write(dut, MODE, 0xFF)
+    got = await spi_xfers(dut, ("w", DOT, 0xFF), ("w", BASE10, 0xFF), ("w", 0x7F, 0xFF))
+    assert got == [[0] * 16] * 3
+
+
+@cocotb.test()
+async def test_read_cut_short_changes_nothing(dut):
+    await start(dut, 0, base=[10, 6, 10, 6], mode=0xE4, dot=0x1B)
+    await load_digits(dut, [8, 5, 9, 5])
+    before = await read_all(dut)
+    for address in (BASE10, MODE, DOT, CTRL, COUNT10, COUNT32, 0x7F):
+        for bits in range(1, 16):
+            await spi_xfers(dut, ("r", address), last_bits=bits)
+    assert await read_all(dut) == before
+    # The count was not loaded: it counts on from 0x5958
+    await FallingEdge(dut.clk)
+    await step(dut, 1)
+    drive(dut, 0, 0)
+    assert await read_all_counts(dut) == (0x59, 0x59)
+    # A cut-short read inside a CS-low period, then a full read and a full write
+    got = await spi_xfers(dut, ("r", BASE10), ("r", BASE32), ("w", DOT, 0x77), ("r", DOT))
+    assert [byte_of(g) for g in (got[1], got[3])] == [0x6A, 0x77]
+    for bits in (9, 12, 15):
+        await spi_xfers(dut, ("r", MODE), last_bits=bits)
+        assert await spi_read(dut, MODE) == 0xE4, f"read after a read cut at {bits}"
+        await spi_xfers(dut, ("w", MODE, 0x00), ("r", MODE), ("r", DOT), last_bits=bits)
+        assert await spi_read(dut, MODE) == 0x00
+        await spi_write(dut, MODE, 0xE4)
+
+
+@cocotb.test()
+async def test_miso_driven_only_while_cs_low(dut):
+    for mode in range(4):
+        await start(dut, 0)
+        drive(dut, 0, 0)
+        await set_mode(dut, mode)
+        oe = {0: 0x03, 1: 0x03, 2: 0x33, 3: 0xF3}[mode]
+        await Timer(1, unit="us")
+        assert int(dut.uio_oe.value) == oe, f"CS high, mode {mode}"
+        assert miso(dut) == 0
+        uio_set(dut, 0)
+        await Timer(SPI_HALF, unit="ns")
+        assert int(dut.uio_oe.value) == oe | MISO_BIT, f"CS low, mode {mode}"
+        await spi_clock_miso(dut, (0x80 | MODE) << 8, 8)
+        assert int(dut.uio_oe.value) == oe | MISO_BIT, "during the transfer"
+        uio_set(dut, CS)
+        await Timer(SPI_HALF, unit="ns")
+        assert int(dut.uio_oe.value) == oe, f"CS high again, mode {mode}"
+        assert miso(dut) == 0
+
+
+@cocotb.test()
+async def test_miso_zero_after_cs_high_mid_byte(dut):
+    # CS goes high while MISO is 1: the next CS-low period starts with 0
+    await start(dut, 0)
+    drive(dut, 0, 0)
+    await spi_write(dut, DOT, 0xFF)
+    await spi_xfers(dut, ("r", DOT), last_bits=10)
+    assert miso(dut) == 0
+    uio_set(dut, 0)
+    await Timer(SPI_HALF, unit="ns")
+    assert miso(dut) == 0, "MISO at the start of the next period"
+    uio_set(dut, CS)
+    await Timer(SPI_HALF, unit="ns")
