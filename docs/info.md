@@ -57,73 +57,86 @@ carry-out of the digit or its inverse. The display shows one digit at a time.
 - The counts are held in flip-flops and the segments are decoded from them, so
   all segments change together after the rising edge of the counter clock.
 
-| Address | Register | Data bits |
-|---------|----------|-----------|
-| 0x00 | BASE10 | 7:4 base of digit 1, 3:0 base of digit 0 (0 means 16) |
-| 0x01 | BASE32 | 7:4 base of digit 3, 3:0 base of digit 2 (0 means 16) |
-| 0x02 | MODE | 7:6 mode of digit 3, 5:4 digit 2, 3:2 digit 1, 1:0 digit 0 |
-| 0x03 | DOT | 7:6 dot of digit 3, 5:4 digit 2, 3:2 digit 1, 1:0 digit 0 |
-| 0x04 | CTRL | 2 DOWN (0 counts up, 1 counts down); 1:0 count mode; 7:3 unused |
-| 0x05 | COUNT10 | 7:4 count of digit 1, 3:0 count of digit 0 |
-| 0x06 | COUNT32 | 7:4 count of digit 3, 3:0 count of digit 2 |
+| Address | Register | Reset | Data bits |
+|---------|----------|-------|-----------|
+| 0x00 | BASE10 | 0x00 | 7:4 base of digit 1, 3:0 base of digit 0 (0 means 16) |
+| 0x01 | BASE32 | 0x00 | 7:4 base of digit 3, 3:0 base of digit 2 (0 means 16) |
+| 0x02 | MODE | 0x00 | 7:6 mode of digit 3, 5:4 digit 2, 3:2 digit 1, 1:0 digit 0 |
+| 0x03 | DOT | 0xAA | 7:6 dot of digit 3, 5:4 digit 2, 3:2 digit 1, 1:0 digit 0 |
+| 0x04 | CTRL | 0x00 | 7:3 unused; 2 UP/DOWN (0 counts up, 1 counts down); 1:0 count mode |
+| 0x05 | COUNT10 | 0x00 | 7:4 count of digit 1, 3:0 count of digit 0 |
+| 0x06 | COUNT32 | 0x00 | 7:4 count of digit 3, 3:0 count of digit 2 |
 
-Display modes: 0 shows the digit, 1 shows it unless its own count is 0 (then
-all segments are off), 2 shows nothing, 3 shows a minus (segment G only).
+### Display mode (MODE, two bits per digit)
 
-Counting down in mode 0 (CTRL bit 2 = 1): with EN = 1 each digit goes down by 1, and a
-digit at 0 wraps to the last digit of its base (F for base 16). A digit steps
-when the digit before it wraps, so 0000 goes to FFFF, and with bases 10, 6, 10,
-6 the clock goes from 00:00 to 59:59. CO is then the borrow: high while EN = 1
-and that digit and all the digits below it are 0. After reset it counts up. In the modes 1 to 3 the direction bit does
-not apply: INC counts up and DEC counts down.
+| Value | Reset | The digit shows |
+|-------|-------|-----------------|
+| 0 | Y | its count |
+| 1 | | its count, and nothing while its own count is 0 |
+| 2 | | nothing |
+| 3 | | a minus (segment G only) |
 
-Count mode (CTRL bits 1:0): in mode 0 the counter is clocked by `clk`, as
-before, CTRL bit 2 gives the direction, and INC and DEC are ignored. In modes
-1, 2 and 3 INC (`ui[1]`) counts up and DEC (`ui[2]`) counts down, each when it
-is pressed, and `clk` does not count. Modes 2 and 3 also scan the display (below).
+### Dot value (DOT, two bits per digit)
+
+| Value | Reset | DP (`uo[7]`) while that digit is shown |
+|-------|-------|----------------------------------------|
+| 0 | | off |
+| 1 | | on |
+| 2 | Y | CO |
+| 3 | | the inverse of CO |
+
+### Count mode (CTRL bits 1:0)
+
+| Signal | Mode 0 (reset) | Mode 1 | Mode 2 | Mode 3 |
+|--------|--------|--------|--------|--------|
+| EN (`ui[0]`) | enables the count | enables the count | enables the count | enables the count |
+| `clk` | counts | — | steps the scan | steps the scan |
+| UP/DOWN (CTRL bit 2) | direction of the count | — | — | — |
+| INC (`ui[1]`) | — | counts up | counts up | counts up |
+| DEC (`ui[2]`) | — | counts down | counts down | counts down |
+| `uio[4]` | in: SEL0 | in: SEL0 | out: scan number, low bit | out: DIG0 |
+| `uio[5]` | in: SEL1 | in: SEL1 | out: scan number, high bit | out: DIG1 |
+| `uio[6]` | — | — | — | out: DIG2 |
+| `uio[7]` | — | — | — | out: DIG3 |
+| Digit on `uo` | picked by SEL | picked by SEL | the scan number | the scan number |
+
+DIG0 to DIG3 are one line per digit, active high, one high at a time.
+
+Counting down: each digit goes down by 1, and a digit at 0 wraps to the last
+digit of its base (F for base 16). A digit steps when the digit before it
+wraps, so 0000 goes to FFFF, and with bases 10, 6, 10, 6 the clock goes from
+00:00 to 59:59. CO is then the borrow: high while EN = 1 and that digit and all
+the digits below it are 0. In the modes 1 to 3 CO is the carry or the borrow
+according to which of INC and DEC was pressed last, and the carry until one
+is pressed.
+
+Counting on the pins (modes 1 to 3): the step comes when INC or DEC is pressed.
 Both next counts, up and down, are worked out all the time, and the DEC pin
 itself picks one in front of the flip-flops (INC leaves DEC low, so up waits).
 The counter clock is a delayed copy of INC or DEC, so the pick is made before
-the edge arrives. The gate-level tests do not model this delay, so the tests
-that press DEC are skipped there and run in RTL simulation; the timing is
-checked by static timing analysis, and by a gate-level run with the delays of
-the build. A direction flip-flop (set by DEC, cleared by INC) only tells
-the display which carry-out to show. The count mode is not glitch-free: a write
-to it may make one edge on the counter clock, which can count or load once. So
-set the mode first, and then the count. A mode write while `clk` is high gives
-the counter one clock edge: change the mode while `clk` is low or EN is low,
-then write the count.
+the edge arrives.
+
+Changing the count mode: the switch of the counter clock between `clk` and the
+pins is not glitch-free. A write to the mode may make one edge on the counter
+clock, which can count or load once, and a mode write while `clk` is high does
+give the counter one edge. So change the mode while `clk` is low or EN is low,
+and write the count after the mode.
 
 Setting the count: a write to COUNT10 or COUNT32 is taken on the next rising
-edge of the counter clock (`clk` in mode 0, the press of INC or DEC in the other modes), which loads those two digits instead of counting, whatever EN
+edge of the counter clock (`clk` in mode 0, the press of INC or DEC in the
+other modes), which loads those two digits instead of counting, whatever EN
 and the direction are. Writing the same value again loads again, and writing
 both registers before one edge loads all four digits on that edge. A digit that
 loads has no carry-out on that edge, and a value at or above the base is taken
 as is. Reset clears the written values, so it never causes a load.
 
 Scan (modes 2 and 3): a 2-bit scan counter steps 0, 1, 2, 3, 0 on every
-rising edge of `clk`, whatever EN is, and the digit it names is the one on
-`uo`. `uio[5:4]` are ignored then. The counter holds in modes 0 and 1 and
-carries on from where it was; reset clears it. Counting is unchanged: INC and
-DEC count, `clk` does not. The scan counter takes the mode from the SPI side
-without a synchroniser, like the other settings.
-
-- Mode 2: the scan number is on `uio[5:4]` (`uio[4]` is the low bit) and
-  `uio[7:6]` read 0. `uio_oe` is 0x30. Wire a 2-to-4 decoder (or a 74HC139)
-  from `uio[5:4]` to the four digit commons.
-- Mode 3: one line per digit on `uio[7:4]`, active high: `uio[4]` is digit 0 and
-  `uio[7]` is digit 3, one high at a time. `uio_oe` is 0xF0. Drive the digit
-  commons from them, through a transistor for each (or use them directly on
-  common-cathode digits with a resistor in each segment line).
-- Modes 0 and 1: `uio_oe` is 0 and nothing is driven. `uio[3:0]` (SPI) are never
-  outputs.
-
-Bit 7 (DP) follows the dot value of the digit scanned. `clk` is the scan rate:
+rising edge of `clk`, whatever EN is. The digit it names is the one on `uo`,
+with its own dot value on DP. The scan counter holds in modes 0 and 1 and
+carries on from where it was; reset clears it. It takes the mode from the SPI
+side without a synchroniser, like the other settings. `clk` is the scan rate:
 run it at about 1 kHz or more so the four digits look steady, or at 1 Hz to
 watch them one by one.
-
-Dot values: 0 is off (bit 7 low), 1 is on (bit 7 high), 2 is CO, 3 is the
-inverse of CO. The reset value of DOT is 0xAA.
 
 | Pin | Name | Direction | Meaning |
 |-----|------|-----------|---------|
