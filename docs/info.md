@@ -102,14 +102,10 @@ driven while CS is low and is 0 except in the data byte of a read.
 | 0x05 | COUNT10 | 0x00 | the count now | 7:4 count of digit 1, 3:0 count of digit 0 |
 | 0x06 | COUNT32 | 0x00 | the count now | 7:4 count of digit 3, 3:0 count of digit 2 |
 
-A write to COUNT10 or COUNT32 sets the count. It is taken on the next step
-(the rising edge of `clk` in mode 0, a press of INC or DEC in the other
-modes), which loads those two digits instead of counting, whatever EN and the
-direction are. Writing the same value again loads again, and writing both
-registers before one step loads all four digits on that step. A digit that
-loads has no carry-out on that step, and a value at or above the base is taken
-as is. A read of COUNT10 or COUNT32 returns the count the digits hold now, not
-the value written.
+A write to COUNT10 or COUNT32 sets those two digits at once, with no step, in
+every count mode and whatever EN is. The next step counts from the loaded
+value, and a value at or above the base is taken as is. A read of COUNT10 or
+COUNT32 returns the count the digits hold now.
 
 ### Display mode (MODE, two bits per digit)
 
@@ -146,9 +142,8 @@ the value written.
 
 ### Reset
 
-`rst_n` low clears the count and the scan counter, drops a written count that
-has not been loaded yet, and sets every register to the reset value in the
-table.
+`rst_n` low clears the count and the scan counter, and sets every register to
+the reset value in the table.
 
 ### Details
 
@@ -157,6 +152,9 @@ table.
 - The SPI side has its own clock, SCK, with no synchroniser to `clk`, INC or
   DEC. Write registers between steps of the counter, not at the moment of one.
   The scan counter takes the count mode the same way.
+- A write to COUNT10 or COUNT32 loads its digits from half an SCK period after
+  the last bit until the next falling edge of SCK, or until CS goes high. A
+  step during that time is not defined.
 - The count is read without a synchroniser too: read COUNT10 and COUNT32
   between steps of the counter.
 - A change on SEL shows at once, without a clock edge.
@@ -168,7 +166,7 @@ table.
   DEC, so the pick is made before the edge arrives.
 - The switch of the counter clock between `clk` and the pins is not
   glitch-free. A write to the count mode may make one edge on the counter
-  clock, which can count or load once, and a write while `clk` is high does
+  clock, which can count once, and a write while `clk` is high does
   give the counter one edge. Change the count mode while `clk` is low or EN is
   low, and write the count after the mode.
 - The scan counter holds in the modes 0 and 1 and carries on from where it

@@ -74,7 +74,7 @@ module digit (
     input  wire [3:0] base,   // count base (use 0 for 16)
     input  wire       pick,   // direction that picks the next count: 0 up, 1 down
     input  wire       down,   // direction that the carry-out shows: 0 up, 1 down
-    input  wire       load,   // 1 loads `value` on the next clock edge instead of counting
+    input  wire       load,   // a high pulse sets the counter to `value` at once (asynchronous)
     input  wire [3:0] value,  // the count to load
     output wire [6:0] seg,    // segments, bits are {g,f,e,d,c,b,a}
     output wire       co_up,  // carry-out of the up chain
@@ -87,7 +87,7 @@ module digit (
 );
 
   // The 4-bit counter is held in flip-flops, the segments are decoded from it
-  reg [3:0] count;
+  wire [3:0] count;
 
   // The table of segment patterns: one hex digit in, its pattern out
   function [6:0] seg7(input [3:0] value);
@@ -116,13 +116,13 @@ module digit (
   // directions at once. With the enable at 0 it holds. Counting up it is one
   // more, and the base itself becomes 0. Counting down it is one less, and
   // below 0 it wraps to base - 1 (F when the base is 16). A count above the
-  // base just counts down into range. A load wins over counting, whatever the
-  // enable is. A loaded value at or above the base is taken as is.
+  // base just counts down into range. A loaded value at or above the base is
+  // taken as is.
   wire [3:0] next_up_raw = count + 4'd1;
   wire [3:0] next_up     = base == next_up_raw ? 4'd0 : next_up_raw;
   wire [3:0] next_down   = zero ? base - 4'd1 : count - 4'd1;
-  wire [3:0] count_up    = load ? value : !en_up ? count : next_up;
-  wire [3:0] count_dn    = load ? value : !en_dn ? count : next_down;
+  wire [3:0] count_up    = !en_up ? count : next_up;
+  wire [3:0] count_dn    = !en_dn ? count : next_down;
 
   // The direction is the last choice in front of the flip-flops: one mux cell
   // per bit. `pick` may still be changing when the clock edge is on its way
@@ -133,11 +133,24 @@ module digit (
   count_mux mux2 (.i0(count_up[2]), .i1(count_dn[2]), .s(pick), .z(count_next[2]));
   count_mux mux3 (.i0(count_up[3]), .i1(count_dn[3]), .s(pick), .z(count_next[3]));
 
-  // On each rising clock edge the counter takes its new value
-  always @(posedge clk or negedge rst_n) begin
-    if (!rst_n) count <= 4'd0;
-    else        count <= count_next;
-  end
+  // On each rising clock edge the counter takes its new value. Each bit also
+  // has an asynchronous set and reset: a load pulse sets the bits that are 1 in
+  // `value` and resets the others, at once and with no clock edge. Reset wins
+  // over the load. A step while `load` is high is not defined.
+  genvar i;
+  generate
+    for (i = 0; i < 4; i = i + 1) begin : bit_ff
+      wire set = load & value[i] & rst_n;
+      wire clr = ~rst_n | (load & ~value[i]);
+      reg q;
+      always @(posedge clk or posedge set or posedge clr) begin
+        if (clr)      q <= 1'b0;
+        else if (set) q <= 1'b1;
+        else          q <= count_next[i];
+      end
+      assign count[i] = q;
+    end
+  endgenerate
 
   // The segments are decoded from the count after the flip-flops (one decoder,
   // no segment flip-flops). After reset the count is 0, so the digit 0 shows.
@@ -147,15 +160,13 @@ module digit (
   // high on the last digit of the base (F for base 16), so the next digit steps
   // when this one wraps to 0. Counting down it is the borrow: high when the
   // count is 0, so the next digit steps down when this one wraps to base - 1.
-  // A digit that is loading has no carry-out, so the next digit does not step
-  // because of the old count.
   // The same chains are built a second time from the undelayed EN for what CO and the
   // dot show, so that the delay of EN (see en_delay) is not in the path from EN to the outputs.
   wire   last  = (count + 4'd1 == base);
-  assign co_up = !load & en_up & last;
-  assign co_dn = !load & en_dn & zero;
-  assign co_up_s = !load & en_up_s & last;
-  assign co_dn_s = !load & en_dn_s & zero;
+  assign co_up = en_up & last;
+  assign co_dn = en_dn & zero;
+  assign co_up_s = en_up_s & last;
+  assign co_dn_s = en_dn_s & zero;
   assign co    = down ? co_dn_s : co_up_s;
 
   // The count is 0 (used by display mode 1 and by counting down)
@@ -187,10 +198,9 @@ module settings (
     output reg  [7:0] dot,    // what bit 7 shows for each digit, 2 bits each, digit 0 in bits 1:0
     output reg        down,   // count direction of all digits: 0 up, 1 down
     output reg  [1:0] count_mode,  // what clocks the counter: 0 is clk, 1 to 3 is INC and DEC
-    output reg  [7:0] count10,  // held count of digits 1 and 0 (digit 1 in bits 7:4)
-    output reg  [7:0] count32,  // held count of digits 3 and 2 (digit 3 in bits 7:4)
-    output reg        tgl10,  // flips on every write to COUNT10
-    output reg        tgl32,  // flips on every write to COUNT32
+    output reg  [7:0] ldata,  // the byte of the last write to COUNT10 or COUNT32 (digit 1 or 3 in bits 7:4)
+    output reg        ld10,   // load pulse of digits 1 and 0: high for one SCK period after a write to COUNT10
+    output reg        ld32,   // load pulse of digits 3 and 2: the same for COUNT32
     output reg  [3:0] base0,  // count base of digit 0 (0 means 16)
     output reg  [3:0] base1,  // count base of digit 1
     output reg  [3:0] base2,  // count base of digit 2
@@ -203,8 +213,8 @@ module settings (
   localparam [6:0] ADDR_MODE   = 7'h02;  // {mode3, mode2, mode1, mode0}
   localparam [6:0] ADDR_DOT    = 7'h03;  // {dot3, dot2, dot1, dot0}
   localparam [6:0] ADDR_CTRL   = 7'h04;  // bits 1:0 are the count mode, bit 2 is down, 7:3 unused
-  localparam [6:0] ADDR_COUNT10 = 7'h05;  // {count1, count0}, loaded on the next clock edge
-  localparam [6:0] ADDR_COUNT32 = 7'h06;  // {count3, count2}, loaded on the next clock edge
+  localparam [6:0] ADDR_COUNT10 = 7'h05;  // {count1, count0}, loaded at once
+  localparam [6:0] ADDR_COUNT32 = 7'h06;  // {count3, count2}, loaded at once
 
   // The bits received so far in this transfer, newest in bit 0. In a read
   // the byte to send replaces them at the 8th edge and moves up from there.
@@ -274,10 +284,6 @@ module settings (
       dot   <= 8'hAA;  // the carry-out of every digit
       down  <= 1'b0;   // count up
       count_mode <= 2'd0;  // clk counts
-      count10 <= 8'd0;
-      count32 <= 8'd0;
-      tgl10 <= 1'b0;
-      tgl32 <= 1'b0;
       base0 <= 4'd0;
       base1 <= 4'd0;
       base2 <= 4'd0;
@@ -289,12 +295,42 @@ module settings (
         ADDR_MODE:   mode <= data;
         ADDR_DOT:    dot <= data;
         ADDR_CTRL:   begin count_mode <= data[1:0]; down <= data[2]; end
-        // A count is held with a toggle bit that flips on every write, so
-        // writing the same value again loads again. The clk side sees the flip.
-        ADDR_COUNT10: begin count10 <= data; tgl10 <= ~tgl10; end
-        ADDR_COUNT32: begin count32 <= data; tgl32 <= ~tgl32; end
-        default: ;
+        default: ;  // the counts are loaded below
       endcase
+    end
+  end
+
+  // Loading a count: the data byte of a write to COUNT10 or COUNT32 is kept
+  // on the 16th rising edge (one byte for both registers). `arm` says which
+  // register that was, from that edge to the next. The load pulse is a flop on
+  // the falling edge that follows: it rises half an SCK period after the last
+  // bit and drops on the next falling edge, or at once when CS goes high or
+  // reset is low. The pulse comes straight from a flop, so it cannot glitch.
+  wire writing = !cs_n && bit_count == 4'd15 && !reading;
+  reg  arm10, arm32;
+  wire ld_clr = cs_n | ~rst_n;
+
+  always @(posedge sck) begin
+    if (writing && (addr == ADDR_COUNT10 || addr == ADDR_COUNT32)) ldata <= data;
+  end
+
+  always @(posedge sck or posedge ld_clr) begin
+    if (ld_clr) begin
+      arm10 <= 1'b0;
+      arm32 <= 1'b0;
+    end else begin
+      arm10 <= writing && addr == ADDR_COUNT10;
+      arm32 <= writing && addr == ADDR_COUNT32;
+    end
+  end
+
+  always @(negedge sck or posedge ld_clr) begin
+    if (ld_clr) begin
+      ld10 <= 1'b0;
+      ld32 <= 1'b0;
+    end else begin
+      ld10 <= arm10;
+      ld32 <= arm32;
     end
   end
 
@@ -336,12 +372,12 @@ module tt_um_cyberhuman_7segment (
   wire       down;
   wire [1:0] count_mode;
   wire [3:0] base0, base1, base2, base3;
-  wire [7:0] count10, count32;
+  wire [7:0] ldata;
   wire [7:0] live10, live32;
   wire       miso;
-  wire       tgl10, tgl32;
-  settings settings0 (.sck, .cs_n, .mosi, .rst_n, .live10, .live32, .miso, .mode, .dot, .down, .count_mode, .count10, .count32,
-                      .tgl10, .tgl32, .base0, .base1, .base2, .base3);
+  wire       ld10, ld32;
+  settings settings0 (.sck, .cs_n, .mosi, .rst_n, .live10, .live32, .miso, .mode, .dot, .down, .count_mode, .ldata,
+                      .ld10, .ld32, .base0, .base1, .base2, .base3);
 
   // INC counts up and DEC counts down in the modes 1 to 3. They come from
   // input pins 4 and 5. A step happens when the input is pressed.
@@ -380,23 +416,10 @@ module tt_um_cyberhuman_7segment (
   // direction pressed in the other modes
   wire count_down = (count_mode == 2'd0) ? down : dec_dir;
 
-  // Loading a count: each write to COUNT10 or COUNT32 flips a toggle bit on
-  // the SCK side. Here a copy of each toggle bit is kept on the counter clock. When the two
-  // differ, the two digits of that register load the held count on this counter
-  // clock edge instead of counting, and the copy catches up. The toggle bits cross
-  // from SCK to clk without a synchroniser, like the other settings.
-  reg cp10, cp32;
-  always @(posedge count_clk or negedge rst_n) begin
-    if (!rst_n) begin
-      cp10 <= 1'b0;
-      cp32 <= 1'b0;
-    end else begin
-      cp10 <= tgl10;
-      cp32 <= tgl32;
-    end
-  end
-  wire load10 = tgl10 != cp10;
-  wire load32 = tgl32 != cp32;
+  // Loading a count: a write to COUNT10 or COUNT32 makes a pulse on ld10 or
+  // ld32 (see settings) that sets the counter flip-flops of its two digits
+  // through their asynchronous set and reset, with no clock edge, whatever the
+  // count mode and EN. The next step counts from the loaded value.
 
   // Segments and carry-out of each of the four digits
   wire [6:0] seg0, seg1, seg2, seg3;
@@ -413,10 +436,10 @@ module tt_um_cyberhuman_7segment (
   // counts when the digit before it has a carry-out. The up chain (carry) and
   // the down chain (borrow) are both worked out all the time; each digit
   // picks its next count from them by the direction, as the last step.
-  digit digit0 (.clk(count_clk), .rst_n, .en_up(en_cnt),  .en_dn(en_cnt),  .en_up_s(en), .en_dn_s(en), .base(base0), .pick(pick_down), .down(count_down), .load(load10), .value(count10[3:0]), .seg(seg0), .co_up(cu0), .co_dn(cd0), .co_up_s(su0), .co_dn_s(sd0), .co(co0), .zero(zero0), .now(live10[3:0]));
-  digit digit1 (.clk(count_clk), .rst_n, .en_up(cu0), .en_dn(cd0), .en_up_s(su0), .en_dn_s(sd0), .base(base1), .pick(pick_down), .down(count_down), .load(load10), .value(count10[7:4]), .seg(seg1), .co_up(cu1), .co_dn(cd1), .co_up_s(su1), .co_dn_s(sd1), .co(co1), .zero(zero1), .now(live10[7:4]));
-  digit digit2 (.clk(count_clk), .rst_n, .en_up(cu1), .en_dn(cd1), .en_up_s(su1), .en_dn_s(sd1), .base(base2), .pick(pick_down), .down(count_down), .load(load32), .value(count32[3:0]), .seg(seg2), .co_up(cu2), .co_dn(cd2), .co_up_s(su2), .co_dn_s(sd2), .co(co2), .zero(zero2), .now(live32[3:0]));
-  digit digit3 (.clk(count_clk), .rst_n, .en_up(cu2), .en_dn(cd2), .en_up_s(su2), .en_dn_s(sd2), .base(base3), .pick(pick_down), .down(count_down), .load(load32), .value(count32[7:4]), .seg(seg3), .co_up(cu3), .co_dn(cd3), .co_up_s(su3), .co_dn_s(sd3), .co(co3), .zero(zero3), .now(live32[7:4]));
+  digit digit0 (.clk(count_clk), .rst_n, .en_up(en_cnt),  .en_dn(en_cnt),  .en_up_s(en), .en_dn_s(en), .base(base0), .pick(pick_down), .down(count_down), .load(ld10), .value(ldata[3:0]), .seg(seg0), .co_up(cu0), .co_dn(cd0), .co_up_s(su0), .co_dn_s(sd0), .co(co0), .zero(zero0), .now(live10[3:0]));
+  digit digit1 (.clk(count_clk), .rst_n, .en_up(cu0), .en_dn(cd0), .en_up_s(su0), .en_dn_s(sd0), .base(base1), .pick(pick_down), .down(count_down), .load(ld10), .value(ldata[7:4]), .seg(seg1), .co_up(cu1), .co_dn(cd1), .co_up_s(su1), .co_dn_s(sd1), .co(co1), .zero(zero1), .now(live10[7:4]));
+  digit digit2 (.clk(count_clk), .rst_n, .en_up(cu1), .en_dn(cd1), .en_up_s(su1), .en_dn_s(sd1), .base(base2), .pick(pick_down), .down(count_down), .load(ld32), .value(ldata[3:0]), .seg(seg2), .co_up(cu2), .co_dn(cd2), .co_up_s(su2), .co_dn_s(sd2), .co(co2), .zero(zero2), .now(live32[3:0]));
+  digit digit3 (.clk(count_clk), .rst_n, .en_up(cu2), .en_dn(cd2), .en_up_s(su2), .en_dn_s(sd2), .base(base3), .pick(pick_down), .down(count_down), .load(ld32), .value(ldata[7:4]), .seg(seg3), .co_up(cu3), .co_dn(cd3), .co_up_s(su3), .co_dn_s(sd3), .co(co3), .zero(zero3), .now(live32[7:4]));
 
   // What each digit shows, by its 2-bit display mode (the segments only, CO
   // is not affected): 0 = the digit as is, 1 = the digit unless its own

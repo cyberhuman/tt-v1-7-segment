@@ -941,41 +941,30 @@ async def test_reset_returns_up(dut):
 
 
 async def load_reg(dut, *writes, en=1, bits=16):
-    # Write count registers (address, value pairs) and wait for the loading
-    # edge, stopping at the falling edge after it. The writes start just after
-    # a rising edge and take at most 6.6 us, so they end before the next one.
-    # EN is 0 until the writes begin, so the edge before them cannot count.
-    # EN is `en` while they run, so the loading edge has that EN.
+    # Write count registers (address, value pairs) in one CS-low period. The
+    # writes start just after a rising edge and take at most 6.6 us, so they
+    # end before the next one: no clk edge comes while the registers load. EN
+    # is `en` while they run, and 0 after them, so the checks that follow can
+    # take their time.
     drive(dut, 0, 0)
     await RisingEdge(dut.clk)
     await Timer(100, unit="ns")
     drive(dut, en, 0)
     await spi_writes(dut, *writes, bits=bits)
-    await RisingEdge(dut.clk)
-    await FallingEdge(dut.clk)
+    drive(dut, 0, 0)
 
 
 async def write_count(dut, value, en=1):
     # Write both count registers (digits 3 and 2 in the high byte of the
-    # 16-bit value) so that all four digits load on the same edge
+    # 16-bit value) in one CS-low period
     await load_reg(dut, (COUNT10, value & 0xFF), (COUNT32, value >> 8), en=en)
 
 
-def digits_of(value):
-    # The four hex digits of a 16-bit value, lowest first
-    return [value >> s & 0xF for s in (0, 4, 8, 12)]
-
-
-@cocotb.test()
-async def test_count_loads_on_next_edge(dut):
-    await start(dut, 0)
-    # One write at a falling edge ends before the next rising edge
-    await spi_write(dut, COUNT10, 0x34)
-    await check_digits_one(dut, 0, 0, en=0)  # nothing changes before the edge
-    # COUNT10 = 0x34: digit 1 is 3, digit 0 is 4; digits 3, 2 are untouched
-    await check_digits(dut, [4, 3, 0, 0], "after the edge", en=0)
-    await load_reg(dut, (COUNT32, 0x12), en=0)
-    await check_digits(dut, [4, 3, 2, 1], "nibble order 1 2 3 4", en=0)
+async def one_step(dut):
+    # Exactly one clock edge with EN = 1, then stop at the falling edge after it
+    drive(dut, 1, 0)
+    await RisingEdge(dut.clk)
+    await FallingEdge(dut.clk)
 
 
 async def check_digits_one(dut, sel, digit, en=1):
@@ -984,119 +973,186 @@ async def check_digits_one(dut, sel, digit, en=1):
     assert int(dut.uo_out.value) & 0x7F == PATTERNS[digit], f"digit {sel}"
 
 
+def digits_of(value):
+    # The four hex digits of a 16-bit value, lowest first
+    return [value >> s & 0xF for s in (0, 4, 8, 12)]
+
+
 @cocotb.test()
-async def test_count_both_registers_one_edge(dut):
-    # EN = 0: the load happens anyway, all four digits on the same edge
+async def test_count_loads_at_once(dut):
+    await start(dut, 0)
+    # One write ends before the next rising edge of clk: nothing has stepped
+    await spi_write(dut, COUNT10, 0x34)
+    # COUNT10 = 0x34: digit 1 is 3, digit 0 is 4; digits 3, 2 are untouched
+    await check_digits(dut, [4, 3, 0, 0], "loaded with no edge", en=0)
+    await load_reg(dut, (COUNT32, 0x12), en=0)
+    await check_digits(dut, [4, 3, 2, 1], "nibble order 1 2 3 4", en=0)
+
+
+async def write_and_check(dut, mode, en, ctrl=0):
+    await start_mode(dut, mode, ctrl=ctrl)
+    await write_count(dut, 0x1234, en=en)
+    await check_digits(dut, [4, 3, 2, 1], f"mode {mode} EN {en}: shown", en=0)
+    assert await read_all_counts(dut) == (0x34, 0x12), f"mode {mode} EN {en}: read"
+
+
+@cocotb.test()
+async def test_count_loads_in_mode0(dut):
+    await write_and_check(dut, 0, 1)
+
+
+@cocotb.test()
+async def test_count_loads_in_mode0_with_en_0(dut):
+    await write_and_check(dut, 0, 0)
+
+
+@cocotb.test()
+async def test_count_loads_in_mode0_down(dut):
+    await write_and_check(dut, 0, 1, ctrl=DOWN)
+
+
+@cocotb.test()
+async def test_count_loads_in_mode1(dut):
+    await write_and_check(dut, 1, 1)
+
+
+@cocotb.test()
+async def test_count_loads_in_mode2(dut):
+    await write_and_check(dut, 2, 1)
+
+
+@cocotb.test()
+async def test_count_loads_in_mode3(dut):
+    await write_and_check(dut, 3, 0)
+
+
+@cocotb.test()
+async def test_count_both_registers_one_cs_period(dut):
+    # Both registers written in one CS-low period both land, EN = 0
     await start(dut, 0)
     await write_count(dut, 0x1234, en=0)
     await check_digits(dut, [4, 3, 2, 1], "loaded with EN = 0", en=0)
-    for sel in range(4):
-        drive(dut, 0, sel)
-        await Timer(1, unit="us")
-        assert int(dut.uo_out.value) & 0x7F == PATTERNS[[4, 3, 2, 1][sel]]
     await FallingEdge(dut.clk)
     await check_digits(dut, [4, 3, 2, 1], "EN = 0 holds after the load", en=0)
+    # The same in the other order
+    await load_reg(dut, (COUNT32, 0x56), (COUNT10, 0x78), en=0)
+    await check_digits(dut, [8, 7, 6, 5], "COUNT32 then COUNT10", en=0)
 
 
 @cocotb.test()
-async def test_load_edge_does_not_count(dut):
+async def test_step_up_counts_from_loaded_value(dut):
     await start(dut, 1)
     await write_count(dut, 0x1234)
-    await check_digits(dut, [4, 3, 2, 1], "the loading edge does not count")
-    await step(dut, 1)
-    await check_digits(dut, [5, 3, 2, 1], "the edge after it counts")
+    await check_digits(dut, [4, 3, 2, 1], "loaded", en=0)
+    await one_step(dut)
+    await check_digits(dut, [5, 3, 2, 1], "one step up", en=0)
+
+
+@cocotb.test()
+async def test_step_down_counts_from_loaded_value(dut):
+    await start(dut, 1, ctrl=DOWN)
+    await write_count(dut, 0x1234)
+    await check_digits(dut, [4, 3, 2, 1], "loaded", en=0)
+    await one_step(dut)
+    await check_digits(dut, [3, 3, 2, 1], "one step down", en=0)
 
 
 @cocotb.test()
 async def test_count10_alone_leaves_upper_digits(dut):
     await start(dut, 1)
     await write_count(dut, 0x1234)
-    await step(dut, 1)
-    # Digits 3, 2 get no carry from a digit that loads, so they hold
+    await one_step(dut)
     await load_reg(dut, (COUNT10, 0xFF))
-    await check_digits(dut, [15, 15, 2, 1], "digits 1, 0 load, 3, 2 hold")
-    await step(dut, 1)
+    await check_digits(dut, [15, 15, 2, 1], "digits 1, 0 load, 3, 2 hold", en=0)
+    await one_step(dut)
     # The next edge counts normally: F F wraps and carries up
-    await check_digits(dut, [0, 0, 3, 1], "then all count")
+    await check_digits(dut, [0, 0, 3, 1], "then all count", en=0)
 
 
 @cocotb.test()
-async def test_count32_alone_leaves_lower_digits_counting(dut):
+async def test_count32_alone_leaves_lower_digits(dut):
     await start(dut, 1)
     await write_count(dut, 0x0003)
     await load_reg(dut, (COUNT32, 0x21))
-    await check_digits(dut, [4, 0, 1, 2], "digits 3, 2 load, 1, 0 count")
+    await check_digits(dut, [3, 0, 1, 2], "digits 3, 2 load, 1, 0 hold", en=0)
+    await one_step(dut)
+    await check_digits(dut, [4, 0, 1, 2], "then all count", en=0)
 
 
 @cocotb.test()
 async def test_same_value_twice_loads_twice(dut):
     await start(dut, 1)
     await load_reg(dut, (COUNT10, 0x05))
-    await check_digits(dut, [5, 0, 0, 0], "first load")
-    await step(dut, 1)
-    await check_digits(dut, [6, 0, 0, 0], "counted in between")
+    await check_digits(dut, [5, 0, 0, 0], "first load", en=0)
+    await one_step(dut)
+    await check_digits(dut, [6, 0, 0, 0], "counted in between", en=0)
     await load_reg(dut, (COUNT10, 0x05))
-    await check_digits(dut, [5, 0, 0, 0], "same value loads again")
-    await step(dut, 1)
-    await check_digits(dut, [6, 0, 0, 0], "no third load")
+    await check_digits(dut, [5, 0, 0, 0], "same value loads again", en=0)
+    await one_step(dut)
+    await check_digits(dut, [6, 0, 0, 0], "no third load", en=0)
 
 
 @cocotb.test()
 async def test_load_base10_then_step(dut):
     await start(dut, 1, base=10)
     await write_count(dut, 0x0009)
-    await check_digits(dut, [9, 0, 0, 0], "loaded 0009")
-    await step(dut, 1)
-    await check_digits(dut, [0, 1, 0, 0], "0010")
+    await check_digits(dut, [9, 0, 0, 0], "loaded 0009", en=0)
+    await one_step(dut)
+    await check_digits(dut, [0, 1, 0, 0], "0010", en=0)
 
 
 @cocotb.test()
 async def test_load_then_step_down(dut):
     await start(dut, 1, base=10, ctrl=DOWN)
     await write_count(dut, 0x0100)
-    await check_digits(dut, [0, 0, 1, 0], "loaded 0100")
-    await step(dut, 1)
-    await check_digits(dut, [9, 9, 0, 0], "0099")
+    await check_digits(dut, [0, 0, 1, 0], "loaded 0100", en=0)
+    await one_step(dut)
+    await check_digits(dut, [9, 9, 0, 0], "0099", en=0)
 
 
 @cocotb.test()
 async def test_load_value_above_base_taken_as_is(dut):
     await start(dut, 1, base=10)
     await write_count(dut, 0x00AB)
-    await check_digits(dut, [11, 10, 0, 0], "loaded as is")
+    await check_digits(dut, [11, 10, 0, 0], "loaded as is", en=0)
 
 
 @cocotb.test()
-async def test_load_has_no_carry(dut):
+async def test_load_does_not_step_next_digit(dut):
     # Digit 0 is F (CO high) when a load of 3 is written: no carry into digit 1
     await start(dut, 1)
     await step(dut, 15)
-    await check_digits(dut, [15, 0, 0, 0], "at F")
+    await check_digits(dut, [15, 0, 0, 0], "at F", en=0)
     await load_reg(dut, (COUNT10, 0x03))
-    await check_digits(dut, [3, 0, 0, 0], "digit 1 did not step")
-    # Loading F: CO is high after the edge, and digit 1 has not stepped
+    await check_digits(dut, [3, 0, 0, 0], "digit 1 did not step", en=0)
+    # Loading F: CO is high at once, and digit 1 has not stepped
     await load_reg(dut, (COUNT10, 0x0F))
+    drive(dut, 1, 0)
+    await Timer(1, unit="us")
     assert int(dut.uo_out.value) == shown(15, 1), "dot is CO after loading F"
-    await check_digits(dut, [15, 0, 0, 0], "loaded F")
-    await step(dut, 1)
-    await check_digits(dut, [0, 1, 0, 0], "carry on the edge after")
+    await check_digits(dut, [15, 0, 0, 0], "loaded F", en=0)
+    await one_step(dut)
+    await check_digits(dut, [0, 1, 0, 0], "carry on the next step", en=0)
     # Digits 1 and 0 both F (carry into digit 2) and loading 0: digit 2 holds
     await load_reg(dut, (COUNT10, 0xFF))
     await load_reg(dut, (COUNT10, 0x00))
-    await check_digits(dut, [0, 0, 0, 0], "digit 2 did not step")
+    await check_digits(dut, [0, 0, 0, 0], "digit 2 did not step", en=0)
 
 
 @cocotb.test()
 async def test_count_cut_short_write_ignored(dut):
-    await start(dut, 1)
+    await start(dut, 0)
     await load_reg(dut, (COUNT10, 0x55), bits=15)
-    await check_digits(dut, [1, 0, 0, 0], "counts, no load")
+    await check_digits(dut, [0, 0, 0, 0], "15 bits load nothing", en=0)
     await load_reg(dut, (COUNT10, 0x55), bits=8)
-    await check_digits(dut, [2, 0, 0, 0], "counts, no load")
+    await check_digits(dut, [0, 0, 0, 0], "8 bits load nothing", en=0)
+    await load_reg(dut, (COUNT10, 0x12), (COUNT32, 0x55), bits=15)
+    await check_digits(dut, [2, 1, 0, 0], "the whole write lands, the cut one does not", en=0)
+    assert await read_all_counts(dut) == (0x12, 0x00)
 
 
 @cocotb.test()
-async def test_reset_loads_nothing(dut):
+async def test_reset_clears_a_loaded_count(dut):
     await start(dut, 0)
     await write_count(dut, 0x1234, en=0)
     dut.rst_n.value = 0
@@ -1105,15 +1161,29 @@ async def test_reset_loads_nothing(dut):
     await FallingEdge(dut.clk)
     await check_digits(dut, [0, 0, 0, 0], "reset after a load", en=0)
     await FallingEdge(dut.clk)
-    await check_digits(dut, [0, 0, 0, 0], "no load after reset", en=0)
-    # A write that has not loaded yet is dropped by a reset too
-    await spi_write(dut, COUNT10, 0x77)
+    await check_digits(dut, [0, 0, 0, 0], "nothing loads after reset", en=0)
+    assert await read_all_counts(dut) == (0, 0)
+
+
+@cocotb.test()
+async def test_reset_wins_over_a_load_in_progress(dut):
+    # Reset goes low while the load pulse is high (after the last SCK edge,
+    # CS still low): the counter is 0 and stays 0 when CS goes high
+    await start(dut, 0)
+    drive(dut, 0, 0)
+    uio_set(dut, 0)
+    await Timer(SPI_HALF, unit="ns")
+    await spi_clock_bits(dut, COUNT10 << 8 | 0x77, 16)
+    await Timer(10, unit="ns")
+    await check_digits_one(dut, 0, 7, en=0)
     dut.rst_n.value = 0
-    await ClockCycles(dut.clk, 3)
+    await Timer(50, unit="ns")
+    await check_digits_one(dut, 0, 0, en=0)
+    uio_set(dut, CS)
+    await Timer(SPI_HALF, unit="ns")
     dut.rst_n.value = 1
-    await FallingEdge(dut.clk)
-    await FallingEdge(dut.clk)
-    await check_digits(dut, [0, 0, 0, 0], "write before reset not loaded", en=0)
+    await Timer(SPI_HALF, unit="ns")
+    await check_digits(dut, [0, 0, 0, 0], "reset won", en=0)
 
 
 @cocotb.test()
@@ -1135,7 +1205,7 @@ async def test_count_leaves_other_registers(dut):
     await FallingEdge(dut.clk)
     assert await lit(dut, 0) == PATTERNS[3], "still counting down"
     await write_count(dut, 0x0000)
-    await step(dut, 1)
+    await one_step(dut)
     await check_digits_one(dut, 0, 9)
     await check_digits_one(dut, 3, 5)
 
@@ -1468,43 +1538,34 @@ async def test_inc_base10(dut):
 
 
 @cocotb.test()
-async def test_count_loads_on_press_of_inc(dut):
+async def test_count_loads_at_once_in_inc_mode(dut):
     await start_mode(dut, 1)
     await inc_pulses(dut, 2)
     await spi_write(dut, COUNT10, 0x34)
     await spi_write(dut, COUNT32, 0x12)
-    # clk edges do not load
+    # Loaded with no press, and clk edges do not change it
+    await check_digits(dut, [4, 3, 2, 1], "loaded with no press", en=0)
     await step(dut, 3)
-    await check_digits(dut, [2, 0, 0, 0], "written, not loaded by clk", en=0)
-    drive(dut, 0, 0)
-    set_inc(dut, 1)
-    await Timer(1, unit="us")
-    await check_digits(dut, [4, 3, 2, 1], "loaded on the press, the load edge does not count", en=0)
-    set_inc(dut, 0)
-    await check_digits(dut, [4, 3, 2, 1], "nothing on release", en=0)
+    await check_digits(dut, [4, 3, 2, 1], "clk does not count", en=0)
     await inc_pulses(dut, 1)
-    await check_digits(dut, [5, 3, 2, 1], "counts after the load")
+    await check_digits(dut, [5, 3, 2, 1], "counts from the loaded value")
     # Writing the same value again loads again, with EN = 0 too
+    drive(dut, 0, 0)
     await spi_write(dut, COUNT10, 0x34)
-    await inc_pulses(dut, 1, en=0)
     await check_digits(dut, [4, 3, 2, 1], "same value again", en=0)
+    await inc_pulses(dut, 1, en=0)
+    await check_digits(dut, [4, 3, 2, 1], "EN = 0 holds", en=0)
 
 
 # Skipped in the gate level run without delays: presses DEC, and that race needs the gate delays.
 @cocotb.test(skip=GL_NO_DELAY)
-async def test_count_loads_on_press_of_dec(dut):
+async def test_count_loads_at_once_then_dec_counts_down(dut):
     await start_mode(dut, 1)
     await spi_write(dut, COUNT10, 0x34)
     await spi_write(dut, COUNT32, 0x12)
-    drive(dut, 1, 0)
-    await Timer(SETTLE, unit="ns")
-    set_dec(dut, 1)
-    await Timer(1, unit="us")
-    await check_digits(dut, [4, 3, 2, 1], "loaded on DEC press, not counted down")
-    set_dec(dut, 0)
-    await check_digits(dut, [4, 3, 2, 1], "nothing on release")
+    await check_digits(dut, [4, 3, 2, 1], "loaded with no press", en=0)
     await dec_pulses(dut, 1)
-    await check_digits(dut, [3, 3, 2, 1], "counts down after the load")
+    await check_digits(dut, [3, 3, 2, 1], "counts down from the loaded value")
 
 
 # Skipped in the gate level run without delays: presses DEC, and that race needs the gate delays.
@@ -1999,7 +2060,7 @@ async def test_read_count_mode0_is_live(dut):
     await start(dut, 0, base=[10, 6, 10, 6])
     assert await spi_read(dut, COUNT10) == 0x00
     await load_digits(dut, [8, 5, 9, 5])
-    # The running count, not the written value: 0x58 and 0x59 now, 0x59 and 0x59
+    # The running count: the written 0x58 and 0x59 now, 0x59 and 0x59
     # after one step, 0x00 and 0x00 after the second (the carry runs through)
     for count10, count32 in ((0x58, 0x59), (0x59, 0x59), (0x00, 0x00)):
         assert await spi_read(dut, COUNT10) == count10
@@ -2016,11 +2077,7 @@ async def check_live_pin_mode(dut, mode):
     await start_mode(dut, mode, base=[10, 6, 10, 6])
     await spi_write(dut, COUNT10, 0x58)
     await spi_write(dut, COUNT32, 0x59)
-    # Written, not loaded yet
-    assert await read_all_counts(dut) == (0x00, 0x00), f"mode {mode} before the load"
-    await inc_pulses(dut, 1, en=0)
-    await Timer(SETTLE, unit="ns")
-    assert await read_all_counts(dut) == (0x58, 0x59), f"mode {mode} after the load"
+    assert await read_all_counts(dut) == (0x58, 0x59), f"mode {mode} after the write"
     for want in ((0x59, 0x59), (0x00, 0x00)):
         await inc_pulses(dut, 1)
         await Timer(SETTLE, unit="ns")
