@@ -10,9 +10,9 @@ You can also include images in this folder and reference them in the markdown. E
 ## How it works
 
 A four-digit counter for a 7-segment display. Each digit counts in its own
-base, and the digits are chained: a digit steps when the digit below it wraps.
-The display shows one digit at a time. The bases, the display options and the
-count are set over SPI.
+base, and a digit steps when the digit below it wraps. The display shows one
+digit at a time. The bases, the display options and the count are set and read
+over SPI.
 
 ### Pins
 
@@ -26,14 +26,14 @@ count are set over SPI.
 | `ui[5]` | DEC | in | counts down when pressed (count modes 1 to 3) |
 | `uio[0]` | BORROW | out | borrow-out of the whole counter |
 | `uio[1]` | CARRY | out | carry-out of the whole counter |
-| `uio[2]` | MISO | out | SPI data out |
-| `uio[4]` | SEL0 / DIG0 | in / out | digit select, low bit (modes 0, 1); scan number, low bit (mode 2); digit 0 line (mode 3) |
-| `uio[5]` | SEL1 / DIG1 | in / out | digit select, high bit (modes 0, 1); scan number, high bit (mode 2); digit 1 line (mode 3) |
-| `uio[6]` | DIG2 | out | digit 2 line (mode 3) |
-| `uio[7]` | DIG3 | out | digit 3 line (mode 3) |
+| `uio[2]` | MISO | out | SPI data out, driven while CS is low |
+| `uio[4]` | SEL0 / DIG0 | in / out | digit select, low bit; an output in count modes 2 and 3 |
+| `uio[5]` | SEL1 / DIG1 | in / out | digit select, high bit; an output in count modes 2 and 3 |
+| `uio[6]` | DIG2 | out | digit 2 line (count mode 3) |
+| `uio[7]` | DIG3 | out | digit 3 line (count mode 3) |
 | `uo[0]` to `uo[6]` | A to G | out | segments of the digit shown, active high |
 | `uo[7]` | DP | out | decimal point of the digit shown |
-| `clk` | | in | counts (mode 0) or steps the scan (modes 2, 3) |
+| `clk` | | in | counts (count mode 0) or steps the scan (count modes 2, 3) |
 | `rst_n` | | in | reset, active low |
 
 `ui[6]`, `ui[7]` and `uio[3]` are unused.
@@ -41,84 +41,82 @@ count are set over SPI.
 ### Counting
 
 Each digit is a 4-bit counter with a base of up to 16. Counting up, it goes
-from 0 to the last digit of its base (F for base 16, 9 for base 10) and wraps
-to 0; counting down, it wraps from 0 to the last digit. A digit steps when the
-digit below it wraps. With base 16 for all four digits the count runs from
-0000 to FFFF; with bases 10, 6, 10, 6 (digit 0 first) it runs from 00:00 to
-59:59.
+from 0 to the last digit of its base (9 for base 10, F for base 16) and wraps
+to 0. Counting down, it wraps from 0 to the last digit.
 
-Digit 2 has a second base, for the hours of a clock. Register ALT32 gives the
-base digit 2 uses while digit 3 is at the last digit of its own base; 0 means
-no second base. Counting up, digit 2 then wraps at the last digit of that base.
-Counting down, it wraps from 0 to the last digit of the base that is in effect
-once digit 3 has stepped. CO, CARRY and BORROW follow the base in effect.
+EN enables the count: with EN = 0 the counter holds. In count mode 0 a step is
+a rising edge of `clk`, up or down by the UP/DOWN bit. In count modes 1 to 3 a
+step is a press of INC (up) or DEC (down): the rising edge of the pin counts
+and the release does nothing.
 
-| Clock | Bases (digit 0 first) | ALT32 | Counts |
-|-------|-----------------------|-------|--------|
-| 24-hour | 10, 6, 10, 3 | 0x04 | 00:00 to 23:59 |
-| 12-hour | 10, 6, 10, 2 | 0x02 | 00:00 to 11:59 |
+Digit 2 can have a second base, which it uses while digit 3 is at the last
+digit of its own base. That is what stops the hours of a clock at 23 or at 11.
+It holds in both directions: counting down, 00:00 goes to 23:59.
 
-EN enables the count: with EN = 0 the counter holds its value. The count mode
-sets what makes a step. In mode 0 it is the rising edge of `clk`, and the
-UP/DOWN bit gives the direction. In the modes 1 to 3 it is a press of INC (up)
-or DEC (down): the step comes on the rising edge of the pin, and nothing
-happens on release.
+| Output | High while EN = 1 and |
+|--------|-----------------------|
+| CARRY | all four digits are at the last digit of their base |
+| BORROW | all four digits are 0 |
+| CO of a digit, counting up | that digit and all the digits below it are at the last digit of their base |
+| CO of a digit, counting down | that digit and all the digits below it are 0 |
 
-Each digit has a carry-out, CO: high while EN = 1 and that digit and all the
-digits below it are at the last digit of their base. Counting down, CO is the
-borrow instead: high while EN = 1 and that digit and all the digits below it
-are 0. In the modes 1 to 3 CO is the carry or the borrow according to which of
-INC and DEC was pressed last, and the carry until one is pressed. CARRY and
-BORROW are the carry-out and the borrow-out of all four digits. Both follow
-the count whatever the direction, the digit shown and the display mode.
+CO is what the decimal point can show. Its direction is the UP/DOWN bit in
+count mode 0, and in count modes 1 to 3 the pin pressed last (up until one is
+pressed).
 
 ### Display
 
 `uo[0]` to `uo[6]` carry the segments of one digit and `uo[7]` its decimal
-point. In the count modes 0 and 1 SEL picks the digit, 0 for the lowest and 3
-for the highest. In the modes 2 and 3 the chip scans the digits itself: a
-2-bit scan counter steps 0, 1, 2, 3, 0 on every rising edge of `clk`, whatever
-EN is, and the digit it names is the one shown. Mode 2 puts the scan number on
-`uio[5:4]`. Mode 3 raises one of DIG0 to DIG3: one line per digit, active
-high, one high at a time.
+point. In count modes 0 and 1 SEL picks the digit: 0 for the lowest, 3 for the
+highest. In count modes 2 and 3 the chip scans the digits itself, one digit
+further on every rising edge of `clk`, whatever EN is. Mode 2 puts the number
+of the digit shown on `uio[5:4]`. Mode 3 raises one of DIG0 to DIG3, one line
+per digit.
 
-Each digit has a display mode and a dot value, in the tables below. The
-display mode changes the segments only and the dot value the decimal point
-only; neither affects the counting.
+Each digit has a display mode, for the segments, and a dot value, for the
+decimal point. Neither affects the counting.
+
+### SPI
+
+CS, MOSI, SCK and MISO are an SPI port, mode 0, most significant bit first.
+Every transfer is 16 clocks: an address byte, then a data byte.
+
+| Transfer | Address byte | Data byte |
+|----------|--------------|-----------|
+| Write | the address | on MOSI; the register takes it on the last clock |
+| Read | the address with bit 7 set (0x80 + address) | sent by the chip on MISO |
+
+Transfers can follow each other while CS stays low. One cut short by CS going
+high changes nothing. An address without a register and reserved bits read 0,
+and a write to them does nothing.
 
 ### Registers
 
-CS, MOSI, SCK and MISO are an SPI port (mode 0, MSB first) that writes and
-reads registers. A write is 16 bits: an address byte, then a data byte. The
-register takes the data on the 16th clock edge, and more writes and reads can
-follow while CS stays low. A write cut short by CS going high changes nothing,
-and so do SCK edges while CS is high. A write to an address without a register
-changes nothing.
+| Address | Register | Reset | Data bits |
+|---------|----------|-------|-----------|
+| 0x00 | BASE10 | 0x00 | 7:4 base of digit 1, 3:0 base of digit 0 (0 means 16) |
+| 0x01 | BASE32 | 0x00 | 7:4 base of digit 3, 3:0 base of digit 2 (0 means 16) |
+| 0x02 | MODE | 0x00 | display mode: 7:6 digit 3, 5:4 digit 2, 3:2 digit 1, 1:0 digit 0 |
+| 0x03 | DOT | 0xAA | dot value: 7:6 digit 3, 5:4 digit 2, 3:2 digit 1, 1:0 digit 0 |
+| 0x04 | CTRL | 0x00 | 7:3 unused; 2 UP/DOWN (0 counts up, 1 counts down); 1:0 count mode |
+| 0x05 | COUNT10 | 0x00 | 7:4 count of digit 1, 3:0 count of digit 0 |
+| 0x06 | COUNT32 | 0x00 | 7:4 count of digit 3, 3:0 count of digit 2 |
+| 0x08 | ALT10 | | reserved |
+| 0x09 | ALT32 | 0x00 | 7:4 reserved; 3:0 second base of digit 2 (0 means none) |
 
-A read is also 16 clocks: the address byte with bit 7 set (0x80 | address),
-then 8 clocks in which the chip sends the byte on MISO, bit 7 first. MISO
-changes on the falling edge of SCK and is valid at the 9th to the 16th rising
-edge; MOSI is ignored in those 8 clocks. The byte is taken on the 8th rising
-edge, when the address is complete. A read writes nothing, and one cut short by
-CS going high changes nothing. An address without a register reads 0. MISO is
-driven while CS is low and is 0 except in the data byte of a read.
+COUNT10 and COUNT32 are the count itself. A write sets those two digits at
+once, in every count mode and whatever EN is, and a read returns what they
+hold now. A value at or above the base is taken as is.
 
-| Address | Register | Reset | Reads | Data bits |
-|---------|----------|-------|-------|-----------|
-| 0x00 | BASE10 | 0x00 | the register | 7:4 base of digit 1, 3:0 base of digit 0 (0 means 16) |
-| 0x01 | BASE32 | 0x00 | the register | 7:4 base of digit 3, 3:0 base of digit 2 (0 means 16) |
-| 0x02 | MODE | 0x00 | the register | 7:6 mode of digit 3, 5:4 digit 2, 3:2 digit 1, 1:0 digit 0 |
-| 0x03 | DOT | 0xAA | the register | 7:6 dot of digit 3, 5:4 digit 2, 3:2 digit 1, 1:0 digit 0 |
-| 0x04 | CTRL | 0x00 | the register | 7:3 unused (read 0); 2 UP/DOWN (0 counts up, 1 counts down); 1:0 count mode |
-| 0x05 | COUNT10 | 0x00 | the count now | 7:4 count of digit 1, 3:0 count of digit 0 |
-| 0x06 | COUNT32 | 0x00 | the count now | 7:4 count of digit 3, 3:0 count of digit 2 |
-| 0x08 | ALT10 | | 0 | reserved, a write does nothing |
-| 0x09 | ALT32 | 0x00 | the register | 7:4 reserved (read 0); 3:0 base of digit 2 while digit 3 is at the last digit of its base (0 means none) |
+### Example settings
 
-A write to COUNT10 or COUNT32 sets those two digits at once, with no step, in
-every count mode and whatever EN is. The next step counts from the loaded
-value, and a value at or above the base is taken as is. A read of COUNT10 or
-COUNT32 returns the count the digits hold now.
+| Count | BASE10 | BASE32 | ALT32 | Runs |
+|-------|--------|--------|-------|------|
+| Hexadecimal | 0x00 | 0x00 | 0x00 | 0000 to FFFF |
+| Decimal | 0xAA | 0xAA | 0x00 | 0000 to 9999 |
+| Minutes and seconds | 0x6A | 0x6A | 0x00 | 00:00 to 59:59 |
+| 24-hour clock | 0x6A | 0x3A | 0x04 | 00:00 to 23:59 |
+| 12-hour clock | 0x6A | 0x2A | 0x02 | 00:00 to 11:59 |
 
 ### Display mode (MODE, two bits per digit)
 
@@ -155,63 +153,53 @@ COUNT32 returns the count the digits hold now.
 
 ### Reset
 
-`rst_n` low clears the count and the scan counter, and sets every register to
-the reset value in the table.
+`rst_n` low clears the count and the scan, and sets every register to its
+reset value.
 
-### Details
+### Timing rules
 
-- INC and DEC: press one at a time; both together is not defined. Pulses, and
-  the gaps between them, must be at least 100 ns.
-- The SPI side has its own clock, SCK, with no synchroniser to `clk`, INC or
-  DEC. Write registers between steps of the counter, not at the moment of one.
-  The scan counter takes the count mode the same way.
-- A write to COUNT10 or COUNT32 loads its digits from half an SCK period after
-  the last bit until the next falling edge of SCK, or until CS goes high. A
-  step during that time is not defined.
-- The count is read without a synchroniser too: read COUNT10 and COUNT32
-  between steps of the counter.
-- A change on SEL shows at once, without a clock edge.
-- The counts are held in flip-flops and the segments are decoded from them, so
-  all segments change together after a step.
-- In the modes 1 to 3 both next counts, up and down, are worked out all the
-  time, and the DEC pin itself picks one in front of the flip-flops (INC
-  leaves DEC low, so up waits). The counter clock is a delayed copy of INC or
-  DEC, so the pick is made before the edge arrives.
-- The switch of the counter clock between `clk` and the pins is not
-  glitch-free. A write to the count mode may make one edge on the counter
-  clock, which can count once, and a write while `clk` is high does
-  give the counter one edge. Change the count mode while `clk` is low or EN is
-  low, and write the count after the mode.
-- The scan counter holds in the modes 0 and 1 and carries on from where it
-  was.
+| Rule | Otherwise |
+|------|-----------|
+| Press INC and DEC one at a time, with pulses and the gaps between them of at least 100 ns | the step is not defined |
+| Write and read registers between steps of the counter, not during one | the value written or read is not defined |
+| Change the count mode while `clk` is low or EN is low, and set the count after it | the counter may take one extra step |
 
 ## How to test
 
 1. Put a 7-segment display on `uo[0]` to `uo[7]` (segments A to G, then the
    decimal point).
 2. Set EN (`ui[3]`) to 1 and SEL (`uio[5:4]`) to 0, the lowest digit.
-3. Pull `rst_n` low for a moment, then release it. The display shows 0 and all
-   bases are 16. For a 24-hour clock, write 0x00 = 0x6A, 0x01 = 0x3A and
-   0x09 = 0x04 over SPI (CS, MOSI and SCK), between clock edges. To leave a 0 blank on
-   the three upper digits, write 0x02 = 0x54.
+3. Pull `rst_n` low for a moment, then release it. The display shows 0.
 4. Apply a slow clock to `clk` (about 1 Hz) or press a push button. The display
-   counts 0, 1, ... 9, A, b, C, d, E, F and wraps to 0 (with base 10 it stops at 9).
-5. The decimal point (CO by default) lights while the display shows the last digit of its
-   base (F by default).
-6. Change SEL: the display shows the next digit, which steps once each time the
-   lowest digit wraps (from F to 0, or from 9 to 0 with base 10).
-7. Set EN to 0: all digits stop.
+   counts 0, 1, ... 9, A, b, C, d, E, F and wraps to 0. The decimal point
+   lights at F.
+5. Change SEL: the display shows the next digit, which steps once each time
+   the digit below it wraps.
+6. Set EN to 0: all digits stop.
+
+Then, over SPI, with `clk` stopped low:
+
+| Write | Effect |
+|-------|--------|
+| 0x00 = 0x6A, 0x01 = 0x3A, 0x09 = 0x04 | a 24-hour clock |
+| 0x05 = 0x59, 0x06 = 0x23 | the count is 23:59; the next step gives 00:00 |
+| 0x02 = 0x54 | a 0 on the three upper digits is left blank |
+| 0x04 = 0x01 | INC and DEC count, `clk` does not |
+| 0x04 = 0x03 | INC and DEC count, `clk` scans the digits, and DIG0 to DIG3 pick the digit |
+
+A read of 0x85 and 0x86 returns the count.
 
 ## External hardware
 
-A 7-segment display on `uo[0]` to `uo[7]` (active high), switches for EN
-(`ui[3]`), push buttons for INC and DEC (`ui[4]`, `ui[5]`) and SEL (`uio[4]`, `uio[5]`; outputs in the modes 2 and 3), an SPI controller (for example the
-RP2040 on the demo board) on `ui[0]`, `ui[1]`, `ui[2]` and `uio[2]` (MISO), and a slow clock
-source or a push button on `clk`. CARRY and BORROW (`uio[1]`, `uio[0]`) can
-enable a further counter.
+A 7-segment display on `uo[0]` to `uo[7]` (active high), a switch for EN
+(`ui[3]`), push buttons for INC and DEC (`ui[4]`, `ui[5]`), switches for SEL
+(`uio[4]`, `uio[5]`; outputs in count modes 2 and 3), an SPI controller (for
+example the RP2040 on the demo board) on `ui[0]`, `ui[1]`, `ui[2]` and
+`uio[2]`, and a slow clock source or a push button on `clk`. CARRY and BORROW
+(`uio[1]`, `uio[0]`) can enable a further counter.
 
-For a four-digit multiplexed display, set the mode to 2 or 3 and put the four
-digits' segment pins in parallel on `uo[0]` to `uo[7]`. Mode 2: a 2-to-4
-decoder on `uio[5:4]` picks the digit common. Mode 3: wire `uio[4]` to `uio[7]`
-straight to the digit commons, 0 to 3 (through transistors if the
+For a four-digit multiplexed display, set the count mode to 2 or 3 and put
+the four digits' segment pins in parallel on `uo[0]` to `uo[7]`. Mode 2: a
+2-to-4 decoder on `uio[5:4]` picks the digit common. Mode 3: wire `uio[4]` to
+`uio[7]` straight to the digit commons, 0 to 3 (through transistors if the
 segments draw more than the pins give).
