@@ -5,8 +5,23 @@
 
 `default_nettype none
 
-// Simulation delays are in nanoseconds (the testbench uses the same scale)
+// Simulation delays are in nanoseconds (the testbench uses the same scale).
+// The ASIC flow has no use for the scale, and its linter warns about every
+// cell of the library, which has none, so it is left out there.
+`ifndef __librelane__
 `timescale 1ns / 1ps
+`endif
+
+// Three modules below are cells of the gf180 cell library, placed by hand.
+// That is for the ASIC flow only. Yosys defines SYNTHESIS in every flow; the
+// FPGA build of Tiny Tapeout also defines SYNTH, and has no such cells, so it
+// gets the plain logic that simulation uses (and no delays: on an FPGA the
+// count modes 1 to 3 and the count load are not timed).
+`ifdef SYNTHESIS
+`ifndef SYNTH
+`define GF180_CELLS
+`endif
+`endif
 
 // A 2:1 mux that is a real cell of the cell library, so synthesis cannot fold
 // it into the logic before it: it stays the last stage in front of a counter
@@ -18,22 +33,24 @@ module count_mux (
     input  wire s,   // select
     output wire z
 );
-`ifdef SYNTHESIS
+`ifdef GF180_CELLS
   gf180mcu_fd_sc_mcu7t5v0__mux2_2 u (.I0(i0), .I1(i1), .S(s), .Z(z));
 `else
   assign z = s ? i1 : i0;
 `endif
 endmodule
 
-// A delay line for the counter clock: a chain of delay cells of the library,
-// which the flow keeps as they are. In RTL simulation it is a plain delay.
-// It must hold the clock edge back until the DEC choice has reached the
-// flip-flops (see project.sdc for how the tools check this).
-module clock_delay (
+// A delay line: a chain of delay cells of the library, which the flow keeps
+// as they are. In RTL simulation it is a plain delay, and the FPGA build has
+// none. It is used twice. On the counter clock it must hold the clock edge
+// back until the DEC choice has reached the flip-flops (see project.sdc for
+// how the tools check this). In the load pulse it holds the start back until
+// the byte to load has settled (see settings).
+module delay_line (
     input  wire i,
     output wire z
 );
-`ifdef SYNTHESIS
+`ifdef GF180_CELLS
   wire [3:0] t;
   gf180mcu_fd_sc_mcu7t5v0__dlyd_2 d0 (.I(i),    .Z(t[0]));
   gf180mcu_fd_sc_mcu7t5v0__dlyd_2 d1 (.I(t[0]), .Z(t[1]));
@@ -51,7 +68,7 @@ module en_delay (
     input  wire i,
     output wire z
 );
-`ifdef SYNTHESIS
+`ifdef GF180_CELLS
   wire [1:0] t;
   gf180mcu_fd_sc_mcu7t5v0__dlyd_2 d0 (.I(i),    .Z(t[0]));
   gf180mcu_fd_sc_mcu7t5v0__dlyd_2 d1 (.I(t[0]), .Z(t[1]));
@@ -93,8 +110,8 @@ module digit (
   wire [3:0] count;
 
   // The table of segment patterns: one hex digit in, its pattern out
-  function [6:0] seg7(input [3:0] value);
-    case (value)
+  function [6:0] seg7(input [3:0] hex);
+    case (hex)
       //              gfedcba
       4'h0: seg7 = 7'b0111111;
       4'h1: seg7 = 7'b0000110;
@@ -118,9 +135,10 @@ module digit (
   // What the counter will be after the next clock edge, worked out for both
   // directions at once. With the enable at 0 it holds. Counting up it is one
   // more, and the base itself becomes 0. Counting down it is one less, and
-  // below 0 it wraps to base - 1 (F when the base is 16). A count above the
-  // base just counts down into range. A loaded value at or above the base is
-  // taken as is.
+  // below 0 it wraps to base - 1 (F when the base is 16). A count at or above
+  // the base (a loaded value is taken as is, and the base can be written
+  // under the count) is out of range: counting up it runs on to F and wraps
+  // to 0, counting down it just counts into range.
   wire [3:0] next_up_raw = count + 4'd1;
   wire [3:0] next_up     = base == next_up_raw ? 4'd0 : next_up_raw;
   wire [3:0] next_down   = zero ? base_dn - 4'd1 : count - 4'd1;
@@ -129,7 +147,7 @@ module digit (
 
   // The direction is the last choice in front of the flip-flops: one mux cell
   // per bit. `pick` may still be changing when the clock edge is on its way
-  // (a DEC press), so the clock is held back (see clock_delay).
+  // (a DEC press), so the clock is held back (see delay_line).
   wire [3:0] count_next;
   count_mux mux0 (.i0(count_up[0]), .i1(count_dn[0]), .s(pick), .z(count_next[0]));
   count_mux mux1 (.i0(count_up[1]), .i1(count_dn[1]), .s(pick), .z(count_next[1]));
@@ -140,9 +158,29 @@ module digit (
   // has an asynchronous set and reset: a load pulse sets the bits that are 1 in
   // `value` and resets the others, at once and with no clock edge. Reset wins
   // over the load. A step while `load` is high is not defined.
+  // The FPGA of the Tiny Tapeout FPGA build has no flip-flop with both a set
+  // and a reset, so there the bit is two flip-flops with a reset only: the
+  // count is p ^ m. The load pulse clears p, and m takes the loaded bit when
+  // the pulse ends (while it is high the bit is shown straight from `value`),
+  // so after a load the count is `value`. A clock edge writes next ^ m into
+  // p, so the count is the next count. Reset clears both.
   genvar i;
   generate
     for (i = 0; i < 4; i = i + 1) begin : bit_ff
+`ifdef SYNTH
+      wire loading = load & rst_n;
+      wire clr = ~rst_n | load;
+      reg p, m;
+      always @(posedge clk or posedge clr) begin
+        if (clr) p <= 1'b0;
+        else     p <= count_next[i] ^ m;
+      end
+      always @(negedge load or negedge rst_n) begin
+        if (!rst_n) m <= 1'b0;
+        else        m <= value[i];
+      end
+      assign count[i] = loading ? value[i] : p ^ m;
+`else
       wire set = load & value[i] & rst_n;
       wire clr = ~rst_n | (load & ~value[i]);
       reg q;
@@ -152,6 +190,7 @@ module digit (
         else          q <= count_next[i];
       end
       assign count[i] = q;
+`endif
     end
   endgenerate
 
@@ -161,11 +200,13 @@ module digit (
 
   // Carry out of each chain, high only when its enable is 1. Counting up it is
   // high on the last digit of the base (F for base 16), so the next digit steps
-  // when this one wraps to 0. Counting down it is the borrow: high when the
-  // count is 0, so the next digit steps down when this one wraps to base - 1.
+  // when this one wraps to 0. F is always a last digit: a count out of range
+  // wraps there, and that wrap carries too, so no step of the next digit is
+  // lost. Counting down it is the borrow: high when the count is 0, so the
+  // next digit steps down when this one wraps to base - 1.
   // The same chains are built a second time from the undelayed EN for what CO and the
   // dot show, so that the delay of EN (see en_delay) is not in the path from EN to the outputs.
-  assign last  = (count + 4'd1 == base);
+  assign last  = (next_up_raw == base) | (count == 4'hF);
   assign at_base = (count == base);
   assign co_up = en_up & last;
   assign co_dn = en_dn & zero;
@@ -187,9 +228,9 @@ endmodule
 // rising edges; MOSI is ignored then). The byte is taken at the 8th rising
 // edge. MISO is 0 outside the data byte of a read. Several writes and reads
 // can follow each other while CS stays low. A write or read cut short by CS
-// going high changes nothing, and so does a write to an address without a
-// register. A read changes nothing and an address without a register reads 0.
-// Everything here is clocked by SCK, not by clk.
+// going high or by reset changes nothing, and so does a write to an address
+// without a register. A read changes nothing and an address without a
+// register reads 0. Everything here is clocked by SCK, not by clk.
 module settings (
     input  wire       sck,    // SPI clock
     input  wire       cs_n,   // SPI chip select, low while a write is sent
@@ -203,8 +244,8 @@ module settings (
     output reg        down,   // count direction of all digits: 0 up, 1 down
     output reg  [1:0] count_mode,  // what clocks the counter: 0 is clk, 1 to 3 is INC and DEC
     output reg  [7:0] ldata,  // the byte of the last write to COUNT10 or COUNT32 (digit 1 or 3 in bits 7:4)
-    output reg        ld10,   // load pulse of digits 1 and 0: high for one SCK period after a write to COUNT10
-    output reg        ld32,   // load pulse of digits 3 and 2: the same for COUNT32
+    output wire       ld10,   // load pulse of digits 1 and 0: high while SCK is high in the last clock of a write to COUNT10
+    output wire       ld32,   // load pulse of digits 3 and 2: the same for COUNT32
     output reg  [3:0] base0,  // count base of digit 0 (0 means 16)
     output reg  [3:0] base1,  // count base of digit 1
     output reg  [3:0] base2,  // count base of digit 2
@@ -233,6 +274,11 @@ module settings (
   // This transfer is a read (set at the 8th edge, cleared at the 16th)
   reg reading;
 
+  // What ends a transfer at once, wherever it is: CS high, or reset low. With
+  // reset in it a transfer can start right after reset even if CS stays low
+  // through it (and so is not a new start for the SPI side).
+  wire spi_clr = cs_n | ~rst_n;
+
   // The byte that an address reads: the register, or for the two count
   // addresses the running count of the digits (not the written value)
   function [7:0] read_byte(input [6:0] a);
@@ -253,11 +299,11 @@ module settings (
   // and the bit on MOSI is the last one. With the read bit set the byte is
   // taken here. In a write the 16th bit completes the data byte: 15 bits are
   // already in the shift register, and the bit on MOSI is the last one.
-  // The counter is held at 0 while CS is high, so a cut-short transfer is
-  // dropped. It is 4 bits wide, so after the 16th bit it wraps to 0 and the
-  // next transfer can follow.
-  always @(posedge sck or posedge cs_n) begin
-    if (cs_n) begin
+  // The counter is held at 0 while CS is high or reset is low, so a cut-short
+  // transfer is dropped. It is 4 bits wide, so after the 16th bit it wraps to
+  // 0 and the next transfer can follow.
+  always @(posedge sck or posedge spi_clr) begin
+    if (spi_clr) begin
       bit_count <= 4'd0;
       reading   <= 1'b0;
     end else begin
@@ -274,13 +320,14 @@ module settings (
 
   // MISO: the top bit of the byte on the falling edge, so it is stable at the
   // next rising edge. 0 when no byte is being sent.
-  always @(negedge sck or posedge cs_n) begin
-    if (cs_n) miso <= 1'b0;
+  always @(negedge sck or posedge spi_clr) begin
+    if (spi_clr) miso <= 1'b0;
     else      miso <= reading & shift[14];
   end
 
-  // The complete write: the address byte, then the data byte
-  wire [15:0] word = {shift, mosi};
+  // The complete write: the address (the read bit in front of it is 0 in a
+  // write and is not looked at here), then the data byte
+  wire [14:0] word = {shift[13:0], mosi};
   wire [6:0]  addr = word[14:8];
   wire [7:0]  data = word[7:0];
 
@@ -311,38 +358,55 @@ module settings (
   end
 
   // Loading a count: the data byte of a write to COUNT10 or COUNT32 is kept
-  // on the 16th rising edge (one byte for both registers). `arm` says which
-  // register that was, from that edge to the next. The load pulse is a flop on
-  // the falling edge that follows: it rises half an SCK period after the last
-  // bit and drops on the next falling edge, or at once when CS goes high or
-  // reset is low. The pulse comes straight from a flop, so it cannot glitch.
+  // on the 16th rising edge (one byte for both registers), and the load pulse
+  // is in the high half of that same clock. So the load needs nothing after
+  // the 16th rising edge: it is over when SCK falls, whether CS then goes
+  // high or stays low, and whatever SCK does next.
+  // The pulse is made of flip-flop outputs only, SCK itself is not gated:
+  //   go10, go32  rise on the 16th rising edge of a write to that register
+  //               and drop on the next rising edge, or at once when CS goes
+  //               high or reset is low;
+  //   go_late     is go10 | go32 through a delay line, so that the pulse
+  //               starts when the byte kept on the same edge has settled;
+  //   done        takes go10 | go32 on the falling edge, so it ends the pulse
+  //               when SCK falls. It is cleared by reset only, not by CS (it
+  //               must not drop before go does), and drops on the first
+  //               falling edge of the next transfer, long before the next
+  //               load.
+  // Each signal changes once on the way up and once on the way down and never
+  // two at the same time (but at reset, which overrides the load in the
+  // counter anyway), so the pulse cannot glitch. SCK must stay high, and
+  // CS low, longer than the delay line takes (see the timing rules in
+  // docs/info.md).
   wire writing = !cs_n && bit_count == 4'd15 && !reading;
-  reg  arm10, arm32;
-  wire ld_clr = cs_n | ~rst_n;
 
   always @(posedge sck) begin
     if (writing && (addr == ADDR_COUNT10 || addr == ADDR_COUNT32)) ldata <= data;
   end
 
-  always @(posedge sck or posedge ld_clr) begin
-    if (ld_clr) begin
-      arm10 <= 1'b0;
-      arm32 <= 1'b0;
+  reg go10, go32;
+  always @(posedge sck or posedge spi_clr) begin
+    if (spi_clr) begin
+      go10 <= 1'b0;
+      go32 <= 1'b0;
     end else begin
-      arm10 <= writing && addr == ADDR_COUNT10;
-      arm32 <= writing && addr == ADDR_COUNT32;
+      go10 <= writing && addr == ADDR_COUNT10;
+      go32 <= writing && addr == ADDR_COUNT32;
     end
   end
 
-  always @(negedge sck or posedge ld_clr) begin
-    if (ld_clr) begin
-      ld10 <= 1'b0;
-      ld32 <= 1'b0;
-    end else begin
-      ld10 <= arm10;
-      ld32 <= arm32;
-    end
+  wire go = go10 | go32;
+  wire go_late;
+  delay_line load_delay (.i(go), .z(go_late));
+
+  reg done;
+  always @(negedge sck or negedge rst_n) begin
+    if (!rst_n) done <= 1'b0;
+    else        done <= go;
   end
+
+  assign ld10 = go10 & go_late & ~done;
+  assign ld32 = go32 & go_late & ~done;
 
 endmodule
 
@@ -414,7 +478,7 @@ module tt_um_cyberhuman_7segment (
   // INC or DEC (low while both are low). This is a plain switch, not
   // glitch-free: a write to the mode makes an edge on it if clk is high.
   wire pin_clk;
-  clock_delay pin_delay (.i(inc | dec), .z(pin_clk));
+  delay_line pin_delay (.i(inc | dec), .z(pin_clk));
   wire count_clk = (count_mode == 2'd0) ? clk : pin_clk;
 
   // The direction that picks the next count: CTRL bit 2 in mode 0, the DEC pin
@@ -538,7 +602,10 @@ module tt_um_cyberhuman_7segment (
   assign uio_out = {mode3 ? {one_hot, 4'b0000} : mode2 ? {2'b00, scan, 4'b0000} : 8'h00} | {5'b0, miso, carry, borrow};
   assign uio_oe  = (mode3 ? 8'hF3 : mode2 ? 8'h33 : 8'h03) | {5'b0, ~cs_n, 2'b0};
 
-  // List all unused inputs to prevent warnings
-  wire _unused = &{ena, uio_in[7:6], uio_in[3:0], ui_in[7:6], 1'b0};
+  // List all unused inputs to prevent warnings, and the outputs of the digits
+  // that nothing uses: the carries out of the delayed chains of digit 3, and
+  // `at_base` and `last` of the digits other than digit 3
+  wire _unused = &{ena, uio_in[7:6], uio_in[3:0], ui_in[7:6],
+                   cu3, cd3, atb0, atb1, atb2, last0, last1, last2, 1'b0};
 
 endmodule

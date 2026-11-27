@@ -44,6 +44,11 @@ Each digit is a 4-bit counter with a base of up to 16. Counting up, it goes
 from 0 to the last digit of its base (9 for base 10, F for base 16) and wraps
 to 0. Counting down, it wraps from 0 to the last digit.
 
+A digit can be at or above its base: the count is written as it is, and a base
+can be lowered under the count. Counting up, such a digit runs on to F and
+wraps to 0 there, and the digit above it steps as at any other wrap. So F is a
+last digit in every base. Counting down, the digit just counts into range.
+
 EN enables the count: with EN = 0 the counter holds. In count mode 0 a step is
 a rising edge of `clk`, up or down by the UP/DOWN bit. In count modes 1 to 3 a
 step is a press of INC (up) or DEC (down): the rising edge of the pin counts
@@ -59,6 +64,8 @@ It holds in both directions: counting down, 00:00 goes to 23:59.
 | BORROW | all four digits are 0 |
 | CO of a digit, counting up | that digit and all the digits below it are at the last digit of their base |
 | CO of a digit, counting down | that digit and all the digits below it are 0 |
+
+F counts as a last digit in every base.
 
 CO is what the decimal point can show. Its direction is the UP/DOWN bit in
 count mode 0, and in count modes 1 to 3 the pin pressed last (up until one is
@@ -87,8 +94,9 @@ Every transfer is 16 clocks: an address byte, then a data byte.
 | Read | the address with bit 7 set (0x80 + address) | sent by the chip on MISO |
 
 Transfers can follow each other while CS stays low. One cut short by CS going
-high changes nothing. An address without a register and reserved bits read 0,
-and a write to them does nothing.
+high or by reset changes nothing, and the next clock after it starts a new
+transfer. An address without a register and reserved bits read 0, and a write
+to them does nothing.
 
 ### Registers
 
@@ -106,7 +114,9 @@ and a write to them does nothing.
 
 COUNT10 and COUNT32 are the count itself. A write sets those two digits at
 once, in every count mode and whatever EN is, and a read returns what they
-hold now. A value at or above the base is taken as is.
+hold now. The digits are set while SCK is high in the last clock of the write;
+when SCK falls the write is over, whatever CS does, and the counter counts on
+from the new value. A value at or above the base is taken as is.
 
 ### Example settings
 
@@ -154,15 +164,20 @@ hold now. A value at or above the base is taken as is.
 ### Reset
 
 `rst_n` low clears the count and the scan, and sets every register to its
-reset value.
+reset value. It also ends an SPI transfer that is under way, as CS high does,
+so the first SCK clock after reset starts a new transfer even if CS stayed
+low.
 
 ### Timing rules
 
 | Rule | Otherwise |
 |------|-----------|
 | Press INC and DEC one at a time, with pulses and the gaps between them of at least 100 ns | the step is not defined |
+| Give `clk`, INC and DEC clean edges: debounce a push button or a switch | every bounce of the contact is a step |
+| Change EN between steps of the counter, not during one | the step is not defined |
 | Write and read registers between steps of the counter, not during one | the value written or read is not defined |
-| Change the count mode while `clk` is low or EN is low, and set the count after it | the counter may take one extra step |
+| Change the count mode while EN is low, or while `clk`, INC and DEC are all low, and set the count after it | the counter may take one extra step |
+| Keep SCK high for at least 50 ns and low for at least 50 ns, and CS low for at least 50 ns after the last rising edge of SCK | a write to the count is not defined |
 
 ## How to test
 
@@ -170,9 +185,9 @@ reset value.
    decimal point).
 2. Set EN (`ui[3]`) to 1 and SEL (`uio[5:4]`) to 0, the lowest digit.
 3. Pull `rst_n` low for a moment, then release it. The display shows 0.
-4. Apply a slow clock to `clk` (about 1 Hz) or press a push button. The display
-   counts 0, 1, ... 9, A, b, C, d, E, F and wraps to 0. The decimal point
-   lights at F.
+4. Apply a slow clock to `clk` (about 1 Hz) or press a debounced push button.
+   The display counts 0, 1, ... 9, A, b, C, d, E, F and wraps to 0. The
+   decimal point lights at F.
 5. Change SEL: the display shows the next digit, which steps once each time
    the digit below it wraps.
 6. Set EN to 0: all digits stop.
@@ -192,11 +207,16 @@ A read of 0x85 and 0x86 returns the count.
 ## External hardware
 
 A 7-segment display on `uo[0]` to `uo[7]` (active high), a switch for EN
-(`ui[3]`), push buttons for INC and DEC (`ui[4]`, `ui[5]`), switches for SEL
-(`uio[4]`, `uio[5]`; outputs in count modes 2 and 3), an SPI controller (for
-example the RP2040 on the demo board) on `ui[0]`, `ui[1]`, `ui[2]` and
-`uio[2]`, and a slow clock source or a push button on `clk`. CARRY and BORROW
-(`uio[1]`, `uio[0]`) can enable a further counter.
+(`ui[3]`), debounced push buttons for INC and DEC (`ui[4]`, `ui[5]`), switches
+for SEL (`uio[4]`, `uio[5]`; outputs in count modes 2 and 3), an SPI
+controller (for example the RP2040 on the demo board) on `ui[0]`, `ui[1]`,
+`ui[2]` and `uio[2]`, and a slow clock source or a debounced push button on
+`clk`. CARRY and BORROW (`uio[1]`, `uio[0]`) can enable a further counter.
+
+The chip does not debounce its inputs: `clk`, INC and DEC count every edge
+they get, so a bare mechanical contact counts several times per press. Use a
+debounced button (an RC filter with a Schmitt trigger, a set-reset latch on a
+changeover switch, or a microcontroller pin).
 
 For a four-digit multiplexed display, set the count mode to 2 or 3 and put
 the four digits' segment pins in parallel on `uo[0]` to `uo[7]`. Mode 2: a

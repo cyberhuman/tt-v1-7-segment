@@ -35,6 +35,24 @@
   "PNR_SDC_FILE": "dir::project.sdc",
   "SIGNOFF_SDC_FILE": "dir::project.sdc",
 
+  "//": "The tools must not use the delay cells. The resizer would take dlyb_1, the smallest cell that",
+  "//": "passes a signal on, as its buffer for inputs and for nets with a high fanout. That cell is too",
+  "//": "weak for the job: using it makes hundreds of nets slower than the slew limit.",
+  "//": "The delay cells placed by hand in project.v (dlyd_2) are not affected.",
+  "EXTRA_EXCLUDED_CELLS": ["gf180mcu_fd_sc_mcu7t5v0__dly*"],
+
+  "//": "The resizer works in the slow corner (125 C, 3.0 V), with a wider margin under the slew limit,",
+  "//": "and a second repair pass runs after global routing, when the wires are known. Sizing for the",
+  "//": "typical corner alone leaves a few hundred nets over the slew limit in the slow one.",
+  "RSZ_CORNERS": ["nom_ss_125C_3v00"],
+  "DESIGN_REPAIR_MAX_SLEW_PCT": 35,
+  "RUN_POST_GRT_DESIGN_REPAIR": 1,
+  "GRT_DESIGN_REPAIR_MAX_SLEW_PCT": 30,
+
+  "//": "The clock trees are built from clkbuf_8, not clkbuf_16. The root buffer of the SCK tree drives",
+  "//": "eight buffers at once, and the inputs of eight clkbuf_16 are over the capacitance limit (0.2 pF).",
+  "CTS_ROOT_BUFFER": "gf180mcu_fd_sc_mcu7t5v0__clkbuf_8",
+
   "//": "Configuration docs: https://librelane.readthedocs.io/en/latest/reference/configuration.html",
 
   "//": "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!",

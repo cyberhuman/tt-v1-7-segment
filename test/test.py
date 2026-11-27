@@ -6,6 +6,7 @@ import os
 import cocotb
 from cocotb.clock import Clock
 from cocotb.triggers import ClockCycles, FallingEdge, RisingEdge, Timer
+from cocotb.utils import get_sim_time
 
 # The gate level run of the repo (make GATES=yes) has no gate delays. The tests
 # that press DEC rely on the DEC pin choosing the count before the delayed
@@ -78,6 +79,8 @@ def drive(dut, en, sel):
     en_now = en
     sel_now = sel
     pins_now(dut)
+
+
 SPI_HALF = 100  # ns, half of one SCK period
 
 
@@ -144,12 +147,25 @@ async def write_settings(dut, base=0, mode=0, dot=DOT_RESET, ctrl=0):
                      *([(CTRL, ctrl & 0xFF)] if ctrl else []))
 
 
+clock_task = None  # the task that drives clk in the test that runs now
+
+
+def start_clock(dut):
+    # One clock per test: a test that calls start() again keeps the clock it
+    # has (a second one on the same pin would fight the first). The task ends
+    # with its test, so the next test starts a new one.
+    global clock_task
+    if clock_task is None or clock_task.done():
+        clock_task = cocotb.start_soon(Clock(dut.clk, 10, unit="us").start())
+
+
 async def start(dut, en, sel=0, base=None, mode=0, dot=DOT_RESET, ctrl=0):
-    # Start the clock, hold reset for a few cycles, then release it.
+    # Start the clock if this test has none yet, hold reset for a few cycles,
+    # then release it.
     # base is one number for all digits, or a list of four (digit 0 first).
     # mode, dot and ctrl are the MODE, DOT and CTRL register values, written
     # with the bases.
-    cocotb.start_soon(Clock(dut.clk, 10, unit="us").start())
+    start_clock(dut)
     dut.ena.value = 1
     global inc_now, dec_now
     inc_now = 0
@@ -211,6 +227,20 @@ async def test_reset(dut):
         drive(dut, 1, sel)
         await Timer(1, unit="us")
         assert dut.uo_out.value == PATTERNS[0], f"digit {sel}"
+
+
+@cocotb.test()
+async def test_start_twice_keeps_one_clock(dut):
+    # A second start() in a test, at another phase of clk, starts no second
+    # clock: the period stays 10 us
+    await start(dut, 0)
+    await Timer(3333, unit="ns")
+    await start(dut, 0)
+    await RisingEdge(dut.clk)
+    for _ in range(6):
+        before = get_sim_time("ns")
+        await RisingEdge(dut.clk)
+        assert get_sim_time("ns") - before == 10_000
 
 
 @cocotb.test()
@@ -1122,6 +1152,60 @@ async def test_load_value_above_base_taken_as_is(dut):
 
 
 @cocotb.test()
+async def test_digit_above_base_carries_at_f(dut):
+    # A digit at or above its base counts up to F and wraps to 0 there. That
+    # wrap carries like any other: the next digit steps, and CO shows at F.
+    await start(dut, 1, base=10)
+    await write_count(dut, 0x000A)
+    for d in range(11, 16):
+        await one_step(dut)
+        await check_digits(dut, [d, 0, 0, 0], "runs on to F", en=0)
+    drive(dut, 1, 0)
+    await Timer(1, unit="us")
+    assert int(dut.uo_out.value) == shown(15, 1), "CO at F"
+    await one_step(dut)
+    await check_digits(dut, [0, 1, 0, 0], "the wrap at F carries", en=0)
+    # Two digits at F: the carry runs through both
+    await write_count(dut, 0x03FF)
+    await one_step(dut)
+    await check_digits(dut, [0, 0, 4, 0], "FF carries into digit 2", en=0)
+    # In range: 9 is the last digit, and E is not one
+    await write_count(dut, 0x009E)
+    drive(dut, 1, 0)
+    await Timer(1, unit="us")
+    assert int(dut.uo_out.value) == shown(14, 0), "no CO at E"
+    await one_step(dut)
+    await check_digits(dut, [15, 9, 0, 0], "E steps to F, no carry", en=0)
+
+
+@cocotb.test()
+async def test_base_written_under_the_count_carries_at_f(dut):
+    # The base is lowered below the count: the digit is out of range, runs on
+    # to F and carries there
+    await start(dut, 1)
+    await write_count(dut, 0x000C)
+    drive(dut, 0, 0)
+    await spi_write(dut, BASE10, 0xAA)
+    await check_digits(dut, [12, 0, 0, 0], "the count stays", en=0)
+    for _ in range(4):
+        await one_step(dut)
+    await check_digits(dut, [0, 1, 0, 0], "C D E F 0, with a carry", en=0)
+
+
+@cocotb.test()
+async def test_carry_pin_at_ffff_in_any_base(dut):
+    # All four digits at F: the next step wraps the whole counter to 0000, so
+    # CARRY is high, whatever the bases
+    await start(dut, 0, base=[10, 6, 10, 6])
+    await load_digits(dut, [15] * 4)
+    drive(dut, 1, 0)
+    await Timer(500, unit="ns")
+    assert carry_borrow(dut) == (1, 0)
+    await one_step(dut)
+    await check_digits(dut, [0, 0, 0, 0], "FFFF wraps to 0000", en=0)
+
+
+@cocotb.test()
 async def test_load_does_not_step_next_digit(dut):
     # Digit 0 is F (CO high) when a load of 3 is written: no carry into digit 1
     await start(dut, 1)
@@ -1169,25 +1253,154 @@ async def test_reset_clears_a_loaded_count(dut):
     assert await read_all_counts(dut) == (0, 0)
 
 
-@cocotb.test()
-async def test_reset_wins_over_a_load_in_progress(dut):
-    # Reset goes low while the load pulse is high (after the last SCK edge,
-    # CS still low): the counter is 0 and stays 0 when CS goes high
-    await start(dut, 0)
+async def count_write_to_last_edge(dut, address, value, high=50):
+    # A count write up to `high` ns after its 16th rising edge: CS low, SCK
+    # still high. The load pulse is high then (it starts a little after the
+    # edge and lasts while SCK is high).
     drive(dut, 0, 0)
     uio_set(dut, 0)
     await Timer(SPI_HALF, unit="ns")
-    await spi_clock_bits(dut, COUNT10 << 8 | 0x77, 16)
-    await Timer(10, unit="ns")
+    word = address << 8 | value
+    await spi_clock_bits(dut, word, 15)
+    uio_set(dut, (word & 1) * MOSI)
+    await Timer(SPI_HALF, unit="ns")
+    uio_set(dut, (word & 1) * MOSI | SCK)
+    await Timer(high, unit="ns")
+
+
+@cocotb.test()
+async def test_reset_wins_over_a_load_in_progress(dut):
+    # Reset goes low while the load pulse is high (SCK high in the last clock
+    # of the write): the counter is 0, and stays 0 when reset goes high with
+    # SCK still high, when SCK goes low and when CS goes high
+    await start(dut, 0)
+    await count_write_to_last_edge(dut, COUNT10, 0x77)
     await check_digits_one(dut, 0, 7, en=0)
     dut.rst_n.value = 0
     await Timer(50, unit="ns")
     await check_digits_one(dut, 0, 0, en=0)
+    dut.rst_n.value = 1
+    await Timer(SPI_HALF, unit="ns")
+    await check_digits_one(dut, 0, 0, en=0)
+    uio_set(dut, 0)
+    await Timer(SPI_HALF, unit="ns")
     uio_set(dut, CS)
+    await Timer(SPI_HALF, unit="ns")
+    await check_digits(dut, [0, 0, 0, 0], "reset won", en=0)
+
+
+@cocotb.test()
+async def test_count_loads_when_cs_rises_before_sck_falls(dut):
+    # The load needs nothing after the 16th rising edge: CS goes high while
+    # SCK is still high, and the count is loaded all the same
+    await start(dut, 0)
+    for high in (30, 50, SPI_HALF):
+        await count_write_to_last_edge(dut, COUNT10, 0x5A, high=high)
+        uio_set(dut, CS | SCK)
+        await Timer(SPI_HALF, unit="ns")
+        uio_set(dut, CS)
+        await Timer(SPI_HALF, unit="ns")
+        await check_digits(dut, [10, 5, 0, 0], f"CS high {high} ns after the edge", en=0)
+        await load_reg(dut, (COUNT10, 0x00), en=0)
+
+
+@cocotb.test()
+async def test_count_runs_on_with_cs_low_after_a_load(dut):
+    # The load is over when SCK falls: with CS still low and SCK idle the
+    # counter counts on from the loaded value, and the registers can be read
+    await start(dut, 0)
+    drive(dut, 0, 0)
+    await FallingEdge(dut.clk)
+    await Timer(100, unit="ns")
+    uio_set(dut, 0)
+    await Timer(SPI_HALF, unit="ns")
+    await spi_clock_bits(dut, COUNT10 << 8 | 0x34, 16)
+    await check_digits(dut, [4, 3, 0, 0], "loaded, CS low", en=0)
+    for _ in range(3):
+        await one_step(dut)
+    await check_digits(dut, [7, 3, 0, 0], "3 steps with CS low", en=0)
+    # A read in the same CS-low period returns the running count
+    got = await spi_clock_miso(dut, (0x80 | COUNT10) << 8 | JUNK, 16)
+    assert byte_of(got) == 0x37
+    # And a second load in it lands too, and does not hold the counter either
+    drive(dut, 0, 0)
+    await FallingEdge(dut.clk)
+    await Timer(100, unit="ns")
+    await spi_clock_bits(dut, COUNT32 << 8 | 0x12, 16)
+    await check_digits(dut, [7, 3, 2, 1], "second load, CS low", en=0)
+    for _ in range(2):
+        await one_step(dut)
+    await check_digits(dut, [9, 3, 2, 1], "2 steps with CS low", en=0)
+    uio_set(dut, CS)
+    await Timer(SPI_HALF, unit="ns")
+    await check_digits(dut, [9, 3, 2, 1], "CS high changes nothing", en=0)
+
+
+@cocotb.test()
+async def test_count_load_is_one_pulse(dut):
+    # After a count write, more SCK clocks with CS low (a cut-short transfer,
+    # a read, a write to another register) do not load the count again
+    await start(dut, 1)
+    drive(dut, 0, 0)
+    await FallingEdge(dut.clk)
+    await Timer(100, unit="ns")
+    uio_set(dut, 0)
+    await Timer(SPI_HALF, unit="ns")
+    await spi_clock_bits(dut, COUNT10 << 8 | 0x21, 16)
+    for _ in range(2):
+        await one_step(dut)
+    await check_digits(dut, [3, 2, 0, 0], "counted on", en=0)
+    await spi_clock_miso(dut, (0x80 | COUNT10) << 8 | JUNK, 16)
+    await spi_clock_bits(dut, MODE << 8 | 0x00, 16)
+    await spi_clock_bits(dut, COUNT10 << 8 | 0x21, 15)
+    await Timer(SPI_HALF, unit="ns")
+    uio_set(dut, CS)
+    await Timer(SPI_HALF, unit="ns")
+    await check_digits(dut, [3, 2, 0, 0], "no second load", en=0)
+
+
+@cocotb.test()
+async def test_reset_ends_a_transfer_with_cs_low(dut):
+    # Reset in the middle of a write with CS low all the time: the bits sent
+    # before it are dropped, and a write sent right after it lands whole
+    await start(dut, 0)
+    drive(dut, 0, 0)
+    uio_set(dut, 0)
+    await Timer(SPI_HALF, unit="ns")
+    await spi_clock_bits(dut, MODE << 8 | 0xFF, 11)
+    dut.rst_n.value = 0
+    await Timer(2 * SPI_HALF, unit="ns")
+    dut.rst_n.value = 1
+    await Timer(2 * SPI_HALF, unit="ns")
+    await spi_clock_bits(dut, BASE10 << 8 | 0x6A, 16)
+    await spi_clock_bits(dut, COUNT32 << 8 | 0x12, 16)
+    await Timer(SPI_HALF, unit="ns")
+    uio_set(dut, CS)
+    await Timer(SPI_HALF, unit="ns")
+    assert await read_all(dut) == [0x6A, 0, 0, DOT_RESET, 0, 0, 0x12]
+
+
+@cocotb.test()
+async def test_reset_ends_a_read_with_cs_low(dut):
+    # Reset in the data byte of a read, while MISO is 1 and CS is low: MISO is
+    # 0 at once, and the read that follows in the same CS-low period is whole
+    await start(dut, 0)
+    drive(dut, 0, 0)
+    await spi_write(dut, DOT, 0xFF)
+    uio_set(dut, 0)
+    await Timer(SPI_HALF, unit="ns")
+    await spi_clock_miso(dut, (0x80 | DOT) << 8 | JUNK, 10)
+    assert miso(dut) == 1
+    dut.rst_n.value = 0
+    await Timer(50, unit="ns")
+    assert miso(dut) == 0, "MISO in reset"
     await Timer(SPI_HALF, unit="ns")
     dut.rst_n.value = 1
     await Timer(SPI_HALF, unit="ns")
-    await check_digits(dut, [0, 0, 0, 0], "reset won", en=0)
+    got = await spi_clock_miso(dut, (0x80 | DOT) << 8 | JUNK, 16)
+    assert byte_of(got) == DOT_RESET
+    uio_set(dut, CS)
+    await Timer(SPI_HALF, unit="ns")
 
 
 @cocotb.test()
@@ -1660,6 +1873,45 @@ async def test_mode_switch_clk_high_en_low_no_step(dut):
 
 
 @cocotb.test()
+async def test_mode_switch_inc_high_en_low_no_step(dut):
+    # With INC (or DEC) high a mode write from mode 0 to a pin mode gives the
+    # counter clock a rising edge even if clk is low; with EN = 0 that edge
+    # counts nothing
+    for pin in (set_inc, set_dec):
+        await start(dut, 1)
+        await step(dut, 3)
+        drive(dut, 0, 0)
+        await FallingEdge(dut.clk)
+        await Timer(100, unit="ns")
+        pin(dut, 1)
+        await Timer(200, unit="ns")
+        await spi_write(dut, CTRL, 1)  # clk low, the pin high
+        await check_digits(dut, [3, 0, 0, 0], "0 -> 1, pin high, EN = 0", en=0)
+        pin(dut, 0)
+        await Timer(200, unit="ns")
+        await check_digits(dut, [3, 0, 0, 0], "pin released", en=0)
+        await inc_pulses(dut, 2)
+        await check_digits(dut, [5, 0, 0, 0], "then INC counts", en=0)
+
+
+@cocotb.test()
+async def test_mode_switch_inc_high_en_high_steps(dut):
+    # Why the rule asks for INC and DEC low as well as clk: with INC high and
+    # EN = 1 the switch from mode 0 to a pin mode is a rising edge of the
+    # counter clock, and it counts
+    await start(dut, 1)
+    await step(dut, 3)
+    await Timer(100, unit="ns")  # just after a falling edge: clk is low
+    set_inc(dut, 1)
+    await Timer(200, unit="ns")
+    await spi_write(dut, CTRL, 1)
+    drive(dut, 0, 0)
+    await Timer(200, unit="ns")
+    set_inc(dut, 0)
+    await check_digits(dut, [4, 0, 0, 0], "the extra step", en=0)
+
+
+@cocotb.test()
 async def test_reset_returns_mode0(dut):
     await start_mode(dut, 1)
     await inc_pulses(dut, 3)
@@ -1859,7 +2111,7 @@ def carry_borrow(dut):
 
 def want_carry_borrow(digits, bases, en):
     bases = [b or 16 for b in bases]
-    carry = en and all(d == b - 1 for d, b in zip(digits, bases))
+    carry = en and all(d == b - 1 or d == 15 for d, b in zip(digits, bases))
     borrow = en and all(d == 0 for d in digits)
     return int(carry), int(borrow)
 
@@ -1886,7 +2138,8 @@ CB_CASES = [
     ([9, 15, 2, 5], [10, 0, 3, 6]),
     ([9, 15, 2, 4], [10, 0, 3, 6]),
     ([8, 15, 2, 5], [10, 0, 3, 6]),
-    ([15, 15, 15, 15], [10, 6, 10, 6]),  # above the bases: no carry
+    ([15, 15, 15, 15], [10, 6, 10, 6]),  # above the bases: F is a last digit all the same
+    ([14, 15, 15, 15], [10, 6, 10, 6]),  # above the bases, digit 0 not at F: no carry
 ]
 
 
@@ -2225,8 +2478,9 @@ async def test_miso_zero_after_cs_high_mid_byte(dut):
 # The second base of digit 2 (ALT32): the hours of a 24-hour or a 12-hour clock
 
 def last_of(d, b):
-    # The last digit of base b (0 means 16)
-    return (d + 1) & 15 == b & 15
+    # The last digit of base b (0 means 16). F is a last digit in every base:
+    # a digit above its base wraps there.
+    return (d + 1) & 15 == b & 15 or d == 15
 
 
 def alt_base(alt, d3, bases):
