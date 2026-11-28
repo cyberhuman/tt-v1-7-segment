@@ -34,7 +34,7 @@ pinout:
   uo[4]: "E"
   uo[5]: "F"
   uo[6]: "G"
-  uo[7]: "DP"
+  uo[7]: "DP / DSEL"
 
   # Bidirectional pins
   uio[0]: "BORROW"

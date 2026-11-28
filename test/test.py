@@ -91,8 +91,10 @@ BASE10, BASE32, MODE, DOT, CTRL, COUNT10, COUNT32 = 0x00, 0x01, 0x02, 0x03, 0x04
 # digit 3 is at the last digit of its own base (0: none), bits 7:4 are reserved.
 ALT10, ALT32 = 0x08, 0x09
 
-# CTRL bits: 1:0 are the count mode (0 clk, 1 to 3 INC and DEC), bit 2 counts down, 7:3 unused
+# CTRL bits: 1:0 are the count mode (0 clk, 1 to 3 INC and DEC), bit 2 counts down,
+# bits 4:3 are PAIR (a two-digit display with a select line on uo_out[7]), 7:5 unused
 DOWN = 0x04
+PAIR_LOW, PAIR_HIGH, PAIR_ALL = 0x08, 0x10, 0x18
 
 # DOT values of one digit, and the register value after reset (CO everywhere)
 DOT_OFF, DOT_ON, DOT_CO, DOT_NCO = 0, 1, 2, 3
@@ -912,11 +914,11 @@ async def test_direction_switch_between_steps(dut):
 async def test_ctrl_reserved_bits_ignored(dut):
     await start_preset(dut)
     # Every value without bit 2 counts up, and changes no other register
-    for value in (0x00, 0xF8):
+    for value in (0x00, 0xE0):
         await spi_write(dut, CTRL, value)
         assert await read_settings(dut) == PRESET, f"CTRL {value:02X}"
     # Every value with bit 2 counts down, the same way
-    for value in (0x04, 0xFC):
+    for value in (0x04, 0xE4):
         await start(dut, 1, base=10)
         await spi_write(dut, CTRL, value)
         await step(dut)
@@ -924,7 +926,7 @@ async def test_ctrl_reserved_bits_ignored(dut):
         await step(dut)
         await check_digits(dut, [8, 9, 9, 9], f"CTRL {value:02X}")
         # Writing it again with other reserved bits changes nothing
-        await set_ctrl(dut, 0xFC if value < 0xFC else 0x04)
+        await set_ctrl(dut, 0xE4 if value < 0xE4 else 0x04)
         await step(dut)
         await check_digits(dut, [7, 9, 9, 9], f"CTRL {value:02X} again")
 
@@ -1294,7 +1296,7 @@ async def test_count_loads_when_cs_rises_before_sck_falls(dut):
     # The load needs nothing after the 16th rising edge: CS goes high while
     # SCK is still high, and the count is loaded all the same
     await start(dut, 0)
-    for high in (30, 50, SPI_HALF):
+    for high in (40, 50, SPI_HALF):
         await count_write_to_last_edge(dut, COUNT10, 0x5A, high=high)
         uio_set(dut, CS | SCK)
         await Timer(SPI_HALF, unit="ns")
@@ -2292,10 +2294,10 @@ async def test_read_each_register_after_write(dut):
     # All of them still hold their own value
     for address, value in REG_VALUES.items():
         assert await spi_read(dut, address) == value, f"register {address:#x} later"
-    # CTRL has 3 bits: the others read 0
+    # CTRL has 5 bits: the others read 0
     await spi_write(dut, CTRL, 0xFF)
-    assert await spi_read(dut, CTRL) == 0x07
-    await spi_write(dut, CTRL, 0xF8)
+    assert await spi_read(dut, CTRL) == 0x1F
+    await spi_write(dut, CTRL, 0xE0)
     assert await spi_read(dut, CTRL) == 0x00
 
 
@@ -2719,3 +2721,177 @@ async def test_alt_cut_short_write_ignored(dut):
     drive(dut, 0, 0)
     await spi_write(dut, ALT32, 0x05, bits=15)
     assert await spi_read(dut, ALT32) == 0
+
+
+# PAIR (CTRL bits 4:3): a two-digit display with a select line on uo_out[7],
+# such as the 7-segment Pmod of Tiny Tapeout. uo_out[7] is high while digit 0
+# or 2 is shown and low while digit 1 or 3 is shown. PAIR_LOW shows the digits
+# 0 and 1 only, PAIR_HIGH the digits 2 and 3 only, PAIR_ALL all four.
+# preset() loads the digits 1, 2, 3, 4, so digit n shows n + 1.
+
+# (CTRL value, the digits shown) of the two values that show one pair
+PAIRS = ((PAIR_LOW, (0, 1)), (PAIR_HIGH, (2, 3)))
+
+
+def pair_shown(digit):
+    # Expected uo_out with PAIR not 0: the pattern of the digit, the select line as the top bit
+    return PATTERNS[digit + 1] | (0x80 if digit % 2 == 0 else 0)
+
+
+def pair_digit(pair, number):
+    # The digit shown for a SEL or scan number
+    if pair == PAIR_ALL:
+        return number
+    return number & 1 | (2 if pair == PAIR_HIGH else 0)
+
+
+@cocotb.test()
+async def test_pair_sel_in_modes_0_1(dut):
+    # SEL0 picks one digit of the pair and SEL1 does nothing; PAIR_ALL leaves SEL as it is
+    for pair in (PAIR_LOW, PAIR_HIGH, PAIR_ALL):
+        for mode in (0, 1):
+            await preset(dut, mode, ctrl=pair)
+            for sel in range(4):
+                drive(dut, 0, sel)
+                await Timer(1, unit="us")
+                what = f"pair {pair:#x} mode {mode} sel {sel}"
+                assert int(dut.uo_out.value) == pair_shown(pair_digit(pair, sel)), what
+                assert int(dut.uio_oe.value) == 0x03 and int(dut.uio_out.value) & 0xFC == 0, what
+
+
+@cocotb.test()
+async def test_pair_scan_alternates(dut):
+    for pair, pair_digits in PAIRS:
+        for mode, oe_want in ((2, 0x33), (3, 0xF3)):
+            await preset(dut, mode, ctrl=pair)
+            digits = []
+            for i, (oe, out, uo) in enumerate(await scan_trace(dut, 9, en=0)):
+                what = f"pair {pair:#x} mode {mode} edge {i}: uo {uo:#x} uio {out:#x}"
+                digit = pair_digits[0] if uo >> 7 else pair_digits[1]
+                digits.append(digit)
+                assert uo == pair_shown(digit), what
+                # The select outputs name the digit shown
+                want = digit << 4 if mode == 2 else (1 << digit) << 4
+                assert oe == oe_want and out & 0xFC == want, what
+            assert all(a != b for a, b in zip(digits, digits[1:])), f"pair {pair:#x} mode {mode}: {digits}"
+
+
+@cocotb.test()
+async def test_pair_all_scans_four_digits(dut):
+    # The scan and the select outputs are those of PAIR = 0; uo_out[7] is the select line
+    for mode, oe_want in ((2, 0x33), (3, 0xF3)):
+        await preset(dut, mode, ctrl=PAIR_ALL)
+        trace = await scan_trace(dut, 9, en=0)
+        first = scan_index(dut) - 8
+        for i, (oe, out, uo) in enumerate(trace):
+            digit = (first + i) % 4
+            want = digit << 4 if mode == 2 else (1 << digit) << 4
+            assert oe == oe_want and out & 0xFC == want, f"mode {mode} edge {i}: uio {out:#x}"
+            assert uo == pair_shown(digit), f"mode {mode} edge {i}: uo {uo:#x}"
+
+
+@cocotb.test()
+async def test_pair_scan_ignores_sel_pins(dut):
+    for pair, pair_digits in PAIRS:
+        await preset(dut, 2, ctrl=pair)
+        for sel in range(4):
+            drive(dut, 0, sel)
+            seen = set()
+            for _ in range(4):
+                await FallingEdge(dut.clk)
+                seen.add(int(dut.uo_out.value))
+            assert seen == {pair_shown(d) for d in pair_digits}, f"pair {pair:#x} sel {sel}"
+
+
+@cocotb.test()
+async def test_pair_ignores_dot(dut):
+    # Every digit at F in count mode 1, so CO is 1 while EN = 1: off, on, CO
+    # and its inverse all give the select line
+    for pair in (PAIR_LOW, PAIR_HIGH, PAIR_ALL):
+        for dot in (0x00, 0x55, 0xAA, 0xFF):
+            await preset(dut, 1, values=(15, 15, 15, 15), dot=dot, ctrl=pair)
+            for en in (0, 1):
+                for sel in range(4):
+                    drive(dut, en, sel)
+                    await Timer(1, unit="us")
+                    assert int(dut.uo_out.value) >> 7 == 1 - (sel & 1), f"pair {pair:#x} dot {dot:#x} en {en} sel {sel}"
+            drive(dut, 0, 0)
+
+
+@cocotb.test()
+async def test_pair_display_modes_apply(dut):
+    # One digit of the pair is a minus and the other shows nothing
+    for pair, mode_value in ((PAIR_LOW, 0b00_00_10_11), (PAIR_HIGH, 0b10_11_00_00)):
+        await preset(dut, 2, ctrl=pair)
+        drive(dut, 0, 0)
+        await spi_write(dut, MODE, mode_value)
+        seen = {t[2] for t in await scan_trace(dut, 6, en=0)}
+        assert seen == {0x80 | MINUS, 0x00}, f"pair {pair:#x}: {[hex(v) for v in seen]}"
+
+
+@cocotb.test()
+async def test_pair_all_four_digits_count(dut):
+    # The digits not shown count too, and CARRY and BORROW cover all four
+    for pair in (PAIR_LOW, PAIR_HIGH, PAIR_ALL):
+        await start(dut, 0, base=10)
+        await set_ctrl(dut, pair)
+        await load_digits(dut, [9, 9, 2, 1])
+        await one_step(dut)
+        drive(dut, 0, 0)
+        assert await read_all_counts(dut) == (0x00, 0x13), f"pair {pair:#x}"
+        await load_digits(dut, [8, 9, 9, 9])
+        await one_step(dut)
+        assert carry_borrow(dut) == (1, 0), f"pair {pair:#x}: 9999"
+        await one_step(dut)
+        assert carry_borrow(dut) == (0, 1), f"pair {pair:#x}: 0000"
+        drive(dut, 0, 0)
+        assert await read_all_counts(dut) == (0x00, 0x00), f"pair {pair:#x}"
+
+
+@cocotb.test()
+async def test_pair_leaves_direction_and_count_mode(dut):
+    for pair in (PAIR_LOW, PAIR_HIGH, PAIR_ALL):
+        await start(dut, 0, base=10)
+        await set_ctrl(dut, pair | DOWN)
+        assert await spi_read(dut, CTRL) == pair | DOWN
+        await FallingEdge(dut.clk)
+        await one_step(dut)
+        drive(dut, 0, 0)
+        assert await read_all_counts(dut) == (0x99, 0x99), f"pair {pair:#x}: counts down on clk"
+        # With count mode 1 INC counts and clk does not
+        await set_mode(dut, 1, ctrl=pair)
+        await step(dut, 3)
+        await inc_pulses(dut, 2)
+        drive(dut, 0, 0)
+        await FallingEdge(dut.clk)
+        assert await read_all_counts(dut) == (0x01, 0x00), f"pair {pair:#x}: INC counts up"
+
+
+@cocotb.test()
+async def test_pair_off_shows_four_digits_again(dut):
+    for pair in (PAIR_LOW, PAIR_HIGH, PAIR_ALL):
+        await preset(dut, 2, ctrl=pair)
+        await scan_trace(dut, 3, en=0)
+        await set_mode(dut, 2)  # CTRL with PAIR = 0
+        trace = await scan_trace(dut, 8, en=0)
+        for i, (_, out, uo) in enumerate(trace):
+            # the dot is CO, which is 0 with EN = 0
+            assert uo == shown((out >> 4 & 3) + 1), f"pair {pair:#x} edge {i}: uo {uo:#x}"
+        assert sorted({t[1] >> 4 & 3 for t in trace}) == [0, 1, 2, 3]
+
+
+@cocotb.test()
+async def test_pair_reset_clears(dut):
+    for pair in (PAIR_LOW, PAIR_HIGH, PAIR_ALL):
+        await preset(dut, 0, ctrl=pair)
+        dut.rst_n.value = 0
+        await ClockCycles(dut.clk, 3)
+        dut.rst_n.value = 1
+        await FallingEdge(dut.clk)
+        assert await spi_read(dut, CTRL) == 0
+        await load_digits(dut, [1, 2, 3, 4])
+        for sel in range(4):
+            drive(dut, 0, sel)
+            await Timer(1, unit="us")
+            assert int(dut.uo_out.value) == shown(sel + 1), f"pair {pair:#x} sel {sel}"
+        drive(dut, 0, 0)

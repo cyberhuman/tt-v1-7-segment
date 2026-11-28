@@ -10,7 +10,8 @@ GF180MCU process. It is written in Verilog and takes one tile.
   12 hours).
 - It counts up or down, on `clk` or on the INC and DEC pins.
 - It shows one digit at a time: the digit picked by two pins, or each digit in
-  turn for a multiplexed four-digit display.
+  turn for a multiplexed four-digit display. It also drives the two-digit
+  7-segment Pmod of Tiny Tapeout.
 - The bases, the display options and the count itself are set and read over
   SPI.
 

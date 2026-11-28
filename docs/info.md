@@ -32,7 +32,7 @@ over SPI.
 | `uio[6]` | DIG2 | out | digit 2 line (count mode 3) |
 | `uio[7]` | DIG3 | out | digit 3 line (count mode 3) |
 | `uo[0]` to `uo[6]` | A to G | out | segments of the digit shown, active high |
-| `uo[7]` | DP | out | decimal point of the digit shown |
+| `uo[7]` | DP / DSEL | out | decimal point of the digit shown; with PAIR not 0, the select line of a two-digit display |
 | `clk` | | in | counts (count mode 0) or steps the scan (count modes 2, 3) |
 | `rst_n` | | in | reset, active low |
 
@@ -83,6 +83,35 @@ per digit.
 Each digit has a display mode, for the segments, and a dot value, for the
 decimal point. Neither affects the counting.
 
+### Two-digit display (CTRL bits 4:3, PAIR)
+
+PAIR is for a display of two digits that share their segment lines and have
+one select line in the place of the decimal point, such as the
+[7-segment Pmod of Tiny Tapeout](https://github.com/TinyTapeout/pcb-files/tree/main/PMOD/icebreaker-pmod-7segmentv2p0). With PAIR not 0, `uo[7]` is DSEL, not
+DP: high while digit 0 or 2 is shown and low while digit 1 or 3 is shown. On
+the Pmod a high level lights the right-hand digit, so digits 0 and 2 are on
+the right. The dot values have no effect then.
+
+| PAIR | Reset | `uo[7]` | Digits shown |
+|------|-------|---------|--------------|
+| 0 | Y | DP | all four |
+| 1 | | DSEL | 0 and 1 |
+| 2 | | DSEL | 2 and 3 |
+| 3 | | DSEL | all four: 0 and 2 take turns on the right, 1 and 3 on the left |
+
+PAIR works in every count mode. With PAIR 1 or 2:
+
+- In count modes 0 and 1 SEL0 picks one digit of the pair and SEL1 does
+  nothing.
+- In count modes 2 and 3 the scan alternates between the two digits on every
+  rising edge of `clk`. `uio[5:4]` (mode 2) and DIG0 to DIG3 (mode 3) name
+  the digit shown, so they carry the two digits of the pair only.
+
+With PAIR 3 SEL and the scan pick the digit as with PAIR 0.
+
+All four digits count whatever PAIR is, and CARRY and BORROW cover all four.
+The display modes apply as with PAIR 0.
+
 ### SPI
 
 CS, MOSI, SCK and MISO are an SPI port, mode 0, most significant bit first.
@@ -106,7 +135,7 @@ to them does nothing.
 | 0x01 | BASE32 | 0x00 | 7:4 base of digit 3, 3:0 base of digit 2 (0 means 16) |
 | 0x02 | MODE | 0x00 | display mode: 7:6 digit 3, 5:4 digit 2, 3:2 digit 1, 1:0 digit 0 |
 | 0x03 | DOT | 0xAA | dot value: 7:6 digit 3, 5:4 digit 2, 3:2 digit 1, 1:0 digit 0 |
-| 0x04 | CTRL | 0x00 | 7:3 unused; 2 UP/DOWN (0 counts up, 1 counts down); 1:0 count mode |
+| 0x04 | CTRL | 0x00 | 7:5 unused; 4:3 PAIR (two-digit display); 2 UP/DOWN (0 counts up, 1 counts down); 1:0 count mode |
 | 0x05 | COUNT10 | 0x00 | 7:4 count of digit 1, 3:0 count of digit 0 |
 | 0x06 | COUNT32 | 0x00 | 7:4 count of digit 3, 3:0 count of digit 2 |
 | 0x08 | ALT10 | | reserved |
@@ -146,6 +175,8 @@ from the new value. A value at or above the base is taken as is.
 | 2 | Y | CO |
 | 3 | | the inverse of CO |
 
+With PAIR not 0 `uo[7]` is DSEL, whatever the dot value.
+
 ### Count mode (CTRL bits 1:0)
 
 | Signal | Mode 0 (reset) | Mode 1 | Mode 2 | Mode 3 |
@@ -160,6 +191,9 @@ from the new value. A value at or above the base is taken as is.
 | `uio[6]` | — | — | — | out: DIG2 |
 | `uio[7]` | — | — | — | out: DIG3 |
 | Digit on `uo` | picked by SEL | picked by SEL | the scan number | the scan number |
+
+PAIR 1 and 2 replace the high bit of SEL and of the scan number: with 0 for
+PAIR 1, with 1 for PAIR 2.
 
 ### Reset
 
@@ -201,6 +235,8 @@ Then, over SPI, with `clk` stopped low:
 | 0x02 = 0x54 | a 0 on the three upper digits is left blank |
 | 0x04 = 0x01 | INC and DEC count, `clk` does not |
 | 0x04 = 0x03 | INC and DEC count, `clk` scans the digits, and DIG0 to DIG3 pick the digit |
+| 0x04 = 0x0A | INC and DEC count, and `clk` alternates digits 0 and 1 on a two-digit display with a select line |
+| 0x04 = 0x12 | the same with digits 2 and 3 |
 
 A read of 0x85 and 0x86 returns the count.
 
@@ -226,3 +262,9 @@ the four digits' segment pins in parallel on `uo[0]` to `uo[7]`. Mode 2: a
 2-to-4 decoder on `uio[5:4]` picks the digit common. Mode 3: wire `uio[4]` to
 `uio[7]` straight to the digit commons, 0 to 3 (through transistors if the
 segments draw more than the pins give).
+
+For the [7-segment Pmod of Tiny Tapeout](https://github.com/TinyTapeout/pcb-files/tree/main/PMOD/icebreaker-pmod-7segmentv2p0), which has two digits, plug it
+into the output header of the demo board and write CTRL = 0x0A (PAIR 1, count
+mode 2) for digits 1 and 0, or CTRL = 0x12 (PAIR 2, count mode 2) for digits 3
+and 2. Run `clk` at 100 Hz or more, so that both digits look lit, and count
+with INC and DEC. The Pmod has no decimal points.

@@ -243,6 +243,7 @@ module settings (
     output reg  [7:0] dot,    // what bit 7 shows for each digit, 2 bits each, digit 0 in bits 1:0
     output reg        down,   // count direction of all digits: 0 up, 1 down
     output reg  [1:0] count_mode,  // what clocks the counter: 0 is clk, 1 to 3 is INC and DEC
+    output reg  [1:0] pair,   // not 0: a two-digit display with a select line on uo[7]; which digits it shows
     output reg  [7:0] ldata,  // the byte of the last write to COUNT10 or COUNT32 (digit 1 or 3 in bits 7:4)
     output wire       ld10,   // load pulse of digits 1 and 0: high while SCK is high in the last clock of a write to COUNT10
     output wire       ld32,   // load pulse of digits 3 and 2: the same for COUNT32
@@ -258,7 +259,7 @@ module settings (
   localparam [6:0] ADDR_BASE32 = 7'h01;  // {base3, base2}
   localparam [6:0] ADDR_MODE   = 7'h02;  // {mode3, mode2, mode1, mode0}
   localparam [6:0] ADDR_DOT    = 7'h03;  // {dot3, dot2, dot1, dot0}
-  localparam [6:0] ADDR_CTRL   = 7'h04;  // bits 1:0 are the count mode, bit 2 is down, 7:3 unused
+  localparam [6:0] ADDR_CTRL   = 7'h04;  // bits 1:0 are the count mode, bit 2 is down, bits 4:3 are pair, 7:5 unused
   localparam [6:0] ADDR_COUNT10 = 7'h05;  // {count1, count0}, loaded at once
   localparam [6:0] ADDR_COUNT32 = 7'h06;  // {count3, count2}, loaded at once
   // 0x08 (second bases of digits 1 and 0) is reserved: writes do nothing, reads 0
@@ -287,7 +288,7 @@ module settings (
       ADDR_BASE32:  read_byte = {base3, base2};
       ADDR_MODE:    read_byte = mode;
       ADDR_DOT:     read_byte = dot;
-      ADDR_CTRL:    read_byte = {5'd0, down, count_mode};
+      ADDR_CTRL:    read_byte = {3'd0, pair, down, count_mode};
       ADDR_COUNT10: read_byte = live10;
       ADDR_COUNT32: read_byte = live32;
       ADDR_ALT32:   read_byte = {4'd0, alt2};
@@ -339,6 +340,7 @@ module settings (
       dot   <= 8'hAA;  // the carry-out of every digit
       down  <= 1'b0;   // count up
       count_mode <= 2'd0;  // clk counts
+      pair  <= 2'd0;   // four digits, uo[7] is the decimal point
       base0 <= 4'd0;
       base1 <= 4'd0;
       base2 <= 4'd0;
@@ -351,7 +353,7 @@ module settings (
         ADDR_ALT32:  alt2 <= data[3:0];
         ADDR_MODE:   mode <= data;
         ADDR_DOT:    dot <= data;
-        ADDR_CTRL:   begin count_mode <= data[1:0]; down <= data[2]; end
+        ADDR_CTRL:   begin count_mode <= data[1:0]; down <= data[2]; pair <= data[4:3]; end
         default: ;  // the counts are loaded below
       endcase
     end
@@ -445,12 +447,13 @@ module tt_um_cyberhuman_7segment (
   wire [7:0] dot;
   wire       down;
   wire [1:0] count_mode;
+  wire [1:0] pair;
   wire [3:0] base0, base1, base2, base3, alt2;
   wire [7:0] ldata;
   wire [7:0] live10, live32;
   wire       miso;
   wire       ld10, ld32;
-  settings settings0 (.sck, .cs_n, .mosi, .rst_n, .live10, .live32, .miso, .mode, .dot, .down, .count_mode, .ldata,
+  settings settings0 (.sck, .cs_n, .mosi, .rst_n, .live10, .live32, .miso, .mode, .dot, .down, .count_mode, .pair, .ldata,
                       .ld10, .ld32, .base0, .base1, .base2, .base3, .alt2);
 
   // INC counts up and DEC counts down in the modes 1 to 3. They come from
@@ -568,8 +571,15 @@ module tt_um_cyberhuman_7segment (
   end
 
   // The digit shown: the SEL pins in the modes 0 and 1, the scan counter in
-  // the modes 2 and 3
-  wire [1:0] sel = scanning ? scan : sel_pin;
+  // the modes 2 and 3. `pair` can fix the high bit of that number, so that
+  // SEL0 picks one of two digits and the scan alternates between them:
+  // 1 fixes it at 0 (digits 0 and 1), 2 fixes it at 1 (digits 2 and 3),
+  // 0 and 3 leave it as it is (all four digits).
+  localparam [1:0] PAIR_OFF  = 2'd0;
+  localparam [1:0] PAIR_LOW  = 2'd1;
+  localparam [1:0] PAIR_HIGH = 2'd2;
+  wire [1:0] sel_all = scanning ? scan : sel_pin;
+  wire [1:0] sel = {pair == PAIR_HIGH || (sel_all[1] && pair != PAIR_LOW), sel_all[0]};
 
   // The selector: SEL chooses which digit's {dot, seg} goes to the output pins.
   // It is plain logic after the flip-flops, so a switch change shows at once,
@@ -585,21 +595,24 @@ module tt_um_cyberhuman_7segment (
     endcase
   end
 
-  assign uo_out  = shown;
+  // With `pair` not 0, bit 7 is not the dot but the select line of a
+  // two-digit display: high while digit 0 or 2 is shown (the right-hand
+  // place), low while digit 1 or 3 is shown (the left-hand place).
+  assign uo_out  = {pair != PAIR_OFF ? ~sel[0] : shown[7], shown[6:0]};
 
-  // The digit select goes out on the bidirectional pins. Mode 2: the scan
-  // number on uio[5:4]. Mode 3: one active-high line per digit on uio[7:4]
-  // (uio[4] is digit 0). In the modes 0 and 1 nothing is driven there.
+  // The digit select goes out on the bidirectional pins. Mode 2: the number
+  // of the digit shown on uio[5:4]. Mode 3: one active-high line per digit on
+  // uio[7:4] (uio[4] is digit 0). In the modes 0 and 1 nothing is driven there.
   // uio[1] is CARRY and uio[0] is BORROW in every count mode: the carry-out
   // and the borrow-out of the whole counter, taken from the chains of the
   // undelayed EN (the ones that CO and the dot show). uio[2] is
   // MISO, an output only while CS is low, and uio[3] is unused.
   wire mode2 = count_mode == 2'd2;
   wire mode3 = count_mode == 2'd3;
-  wire [3:0] one_hot = 4'b0001 << scan;
+  wire [3:0] one_hot = 4'b0001 << sel;
   wire carry  = su3;
   wire borrow = sd3;
-  assign uio_out = {mode3 ? {one_hot, 4'b0000} : mode2 ? {2'b00, scan, 4'b0000} : 8'h00} | {5'b0, miso, carry, borrow};
+  assign uio_out = {mode3 ? {one_hot, 4'b0000} : mode2 ? {2'b00, sel, 4'b0000} : 8'h00} | {5'b0, miso, carry, borrow};
   assign uio_oe  = (mode3 ? 8'hF3 : mode2 ? 8'h33 : 8'h03) | {5'b0, ~cs_n, 2'b0};
 
   // List all unused inputs to prevent warnings, and the outputs of the digits
