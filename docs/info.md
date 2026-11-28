@@ -206,12 +206,15 @@ A read of 0x85 and 0x86 returns the count.
 
 ## External hardware
 
-A 7-segment display on `uo[0]` to `uo[7]` (active high), a switch for EN
-(`ui[3]`), debounced push buttons for INC and DEC (`ui[4]`, `ui[5]`), switches
-for SEL (`uio[4]`, `uio[5]`; outputs in count modes 2 and 3), an SPI
-controller (for example the RP2040 on the demo board) on `ui[0]`, `ui[1]`,
-`ui[2]` and `uio[2]`, and a slow clock source or a debounced push button on
-`clk`. CARRY and BORROW (`uio[1]`, `uio[0]`) can enable a further counter.
+- A 7-segment display on `uo[0]` to `uo[7]` (active high).
+- A switch for EN (`ui[3]`).
+- Debounced push buttons for INC and DEC (`ui[4]`, `ui[5]`).
+- Switches for SEL (`uio[4]`, `uio[5]`; outputs in count modes 2 and 3).
+- An SPI controller (for example the RP2040 on the demo board) on `ui[0]`,
+  `ui[1]`, `ui[2]` and `uio[2]`.
+- A slow clock source or a debounced push button on `clk`.
+
+CARRY and BORROW (`uio[1]`, `uio[0]`) can enable a further counter.
 
 The chip does not debounce its inputs: `clk`, INC and DEC count every edge
 they get, so a bare mechanical contact counts several times per press. Use a
