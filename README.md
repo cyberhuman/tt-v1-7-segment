@@ -24,6 +24,7 @@ rules and how to test the chip.
 |------|------------|
 | [src/project.v](src/project.v) | the design; the top module is `tt_um_cyberhuman_7segment` |
 | [src/config.json](src/config.json), [src/project.sdc](src/project.sdc) | settings and timing constraints for hardening |
+| [src/segment_art.v](src/segment_art.v), [macros/](macros) | the picture in metal at the left edge of the tile |
 | [test/test.py](test/test.py) | the tests (cocotb) |
 | [docs/info.md](docs/info.md) | the documentation, which becomes the datasheet |
 | [info.yaml](info.yaml) | the project description and the pinout for Tiny Tapeout |
@@ -43,6 +44,29 @@ make -B GATES=yes SDF=<file>     # the hardened netlist, with the delays of one 
 
 The last two need `PDK_ROOT` set and the netlist of a hardened design
 (`runs/wokwi/final/pnl/*.pnl.v`) copied to `test/gate_level_netlist.v`.
+
+## The picture
+
+The left edge of the tile has a picture in metal: the text `CYBER_V1|SG'26`,
+where the bar is a double line. The text runs up the edge, turned a quarter
+turn counter-clockwise, so it stands above the design when the left edge of
+the tile is at the top. The picture is 38 pixels wide and 402 tall, and a
+pixel is 0.38 µm square. The same shapes are on all four metal layers of the tile,
+Metal1 to Metal4, one above the other, with no vias between them.
+
+The picture is a macro without pins or logic. `MACROS` in
+[src/config.json](src/config.json) places it. It takes the place of the first
+26 cell sites of every row, and no wire of the tile crosses it.
+
+```sh
+python macros/draw_picture.py    # draws macros/segment_art.png
+python macros/make_art.py        # makes macros/segment_art.gds and .lef from it
+```
+
+The two scripts need the Python packages `gdstk` and `pillow`, which the Tiny
+Tapeout tools install. `make_art.py` takes any black-and-white picture of
+38 by 402 pixels, where white is metal. Two metal pixels must not touch only at
+a corner; the script adds a pixel beside such a corner.
 
 ## What is Tiny Tapeout?
 

@@ -8,6 +8,7 @@ project:
   top_module: "tt_um_cyberhuman_7segment" # Name of the top module in your Verilog file
   source_files:
     - "project.v"
+    - "segment_art.v"
   clock_hz: 1 # Clock frequency in Hz (or 0 if not applicable)
 
   # How many tiles your design occupies? A single tile is about 340x160 uM.

@@ -621,4 +621,8 @@ module tt_um_cyberhuman_7segment (
   wire _unused = &{ena, uio_in[7:6], uio_in[3:0], ui_in[7:6],
                    cu3, cd3, atb0, atb1, atb2, last0, last1, last2, 1'b0};
 
+  // The picture in metal (segment_art.v)
+  (* keep *)
+  segment_art art ();
+
 endmodule

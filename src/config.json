@@ -56,6 +56,22 @@
   "CTS_ROOT_BUFFER": "gf180mcu_fd_sc_mcu7t5v0__clkbuf_8",
   "CTS_DISTANCE_BETWEEN_BUFFERS": 60,
 
+  "//": "The picture in metal at the left edge of the tile (macros/make_art.py), on Metal1 to Metal4.",
+  "//": "It takes the place of the first 26 cell sites of every row, and no wire of the tile crosses",
+  "//": "it. The halo settings let the cells and the power straps come right up to its edge.",
+  "MACROS": {
+    "segment_art": {
+      "instances": { "art": { "location": [3.36, 3.92], "orientation": "N" } },
+      "gds": ["dir::../macros/segment_art.gds"],
+      "lef": ["dir::../macros/segment_art.lef"]
+    }
+  },
+  "IGNORE_DISCONNECTED_MODULES": ["segment_art"],
+  "FP_MACRO_HORIZONTAL_HALO": 0,
+  "FP_MACRO_VERTICAL_HALO": 0,
+  "PDN_HORIZONTAL_HALO": 0,
+  "PDN_VERTICAL_HALO": 0,
+
   "//": "Configuration docs: https://librelane.readthedocs.io/en/latest/reference/configuration.html",
 
   "//": "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!",

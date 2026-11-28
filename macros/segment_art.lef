@@ -1,0 +1,21 @@
+VERSION 5.7 ;
+  NOWIREEXTENSIONATPIN ON ;
+  DIVIDERCHAR "/" ;
+  BUSBITCHARS "[]" ;
+MACRO segment_art
+  CLASS BLOCK ;
+  FOREIGN segment_art ;
+  ORIGIN 0.000 0.000 ;
+  SIZE 14.560 BY 152.880 ;
+  OBS
+      LAYER Metal1 ;
+        RECT 0.000 0.000 14.560 152.880 ;
+      LAYER Metal2 ;
+        RECT 0.000 0.000 14.560 152.880 ;
+      LAYER Metal3 ;
+        RECT 0.000 0.000 14.560 152.880 ;
+      LAYER Metal4 ;
+        RECT 0.000 0.000 14.560 152.880 ;
+  END
+END segment_art
+END LIBRARY
